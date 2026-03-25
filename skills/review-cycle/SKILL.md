@@ -16,23 +16,56 @@ PR number: $ARGUMENTS (if not provided — detect from the current branch via `g
 
 Repeat the following steps until the reviewer approves the PR or no comments remain:
 
-### 1. Request review
+### 1. Check for earlier open PRs
+
+Before requesting review, check if there are open PRs with lower numbers than the current one:
+```bash
+gh pr list --state open --json number,title,headRefName --jq '[.[] | select(.number < PR_NUMBER)]'
+```
+If earlier open PRs exist — ask the user (via AskUserQuestion) how to proceed:
+- **Merge earlier first** — run `/review-cycle` on the earlier PR first, then return to this one
+- **Review both in parallel** — proceed with this PR while the earlier one is handled separately
+- **Skip check** — ignore earlier PRs and proceed with this one
+
+Only continue after the user responds.
+
+### 2. Request review
+
 Leave a comment on the PR instructing the reviewer to focus on significant issues:
 ```
 gh pr comment <PR> --body "@claude review. Focus on critical issues: bugs, security vulnerabilities, logical errors, data loss risks, performance problems. Do NOT nitpick style, naming conventions, minor formatting, or subjective preferences — only flag issues that could break functionality or cause real harm in production."
 ```
 
-### 2. Wait for reviewer response
-Wait 2 minutes, then check for new comments and review status:
-```
-gh pr view <PR> --json reviews,comments
-```
-If no response yet — wait another 1 minute and check again (maximum 1 additional attempt).
+### 3. Wait for reviewer response
 
-### 3. Analyze comments
-Read all comments and review comments. If the status is "APPROVED" and there are no new comments — go to step 6.
+#### 3.1. Find the bot's comment
+Wait 20 seconds, then fetch issue comments and find the latest one from `claude[bot]`:
+```bash
+gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | select(.user.login == "claude[bot]")] | last | {id, created_at, body}'
+```
+Save the `COMMENT_ID` and `created_at` timestamp.
 
-### 3.1. Triage comments (subagent)
+If no comment found — wait 20 more seconds and retry (max 3 total attempts). If still not found — notify the user and stop.
+
+#### 3.2. Poll the comment
+Every 30 seconds, check the comment body:
+```bash
+gh api repos/{owner}/{repo}/issues/comments/{COMMENT_ID} --jq '.body'
+```
+The review is complete when the body contains the string `Claude finished` (the progress checklist with checkboxes disappears from the body at this point).
+
+#### 3.3. Timeout
+Maximum wait time: 7 minutes from the comment's `created_at`. If `Claude finished` hasn't appeared by then — take the current body as final and proceed to step 4. Notify the user that the review may be incomplete.
+
+### 4. Analyze and triage comments
+
+Read all comments and review comments from ALL reviewers (bot and human). Fetch both issue comments and PR review comments:
+```bash
+gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.login, body, created_at}]'
+gh pr view <PR> --json reviews --jq '.reviews'
+```
+Process comments from every reviewer, not just `claude[bot]`. If the status is "APPROVED" and there are no new comments from any reviewer — go to step 7.
+
 Launch a subagent (Agent tool) to triage each comment. The subagent must:
 - Read the current code of files referenced in the comments
 - Check whether the issue was already fixed in previous commits (compare with what the reviewer is requesting)
@@ -49,19 +82,19 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 - `CONFLICTING` — quote the contradicting previous comment and ask the reviewer to clarify
 - `HALLUCINATION` — show concrete evidence from the codebase (grep results, file contents) that disproves the reviewer's claim
 
-### 4. Fix issues
-- Only fix comments with the `FIX` verdict from step 3.1
+### 5. Fix issues
+- Only fix comments with the `FIX` verdict from step 4
 - Read the files referenced in the comments
 - Apply fixes
 - Run linter: `ruff check src/ tests/`
 - Run tests: `pytest tests/ -v`
 
-### 5. Commit and push
+### 6. Commit and push
 - Commit fixes with a meaningful message
 - Push to remote
-- Return to step 1
+- Return to step 2
 
-### 6. Finalization
+### 7. Finalization
 When the PR is approved and no comments remain:
 ```bash
 gh pr merge <PR> --squash --delete-branch
