@@ -19,7 +19,7 @@ cp -r claude-code-review-cycle-skill/skills/review-cycle ~/.claude/skills/
 ## Usage
 
 ```
-/rc [pr-number]
+/cycle-review (cr) [pr-number]
 ```
 
 If no PR number is provided, the skill auto-detects it from the current branch.

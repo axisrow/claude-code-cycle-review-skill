@@ -19,7 +19,7 @@ cp -r claude-code-review-cycle-skill/skills/review-cycle ~/.claude/skills/
 ## Использование
 
 ```
-/rc [pr-number]
+/cycle-review (cr) [pr-number]
 ```
 
 Если номер PR не указан, скилл определяет его автоматически из текущей ветки.
