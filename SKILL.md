@@ -22,12 +22,14 @@ Before requesting review, check if there are open PRs with lower numbers than th
 ```bash
 gh pr list --state open --json number,title,headRefName --jq '[.[] | select(.number < PR_NUMBER)]'
 ```
-If earlier open PRs exist — ask the user (via AskUserQuestion) how to proceed:
-- **Merge earlier first** — run `/review-cycle` on the earlier PR first, then return to this one
-- **Review both in parallel** — proceed with this PR while the earlier one is handled separately
-- **Skip check** — ignore earlier PRs and proceed with this one
+If no earlier open PRs — proceed to step 2.
 
-Only continue after the user responds.
+If earlier open PRs exist — analyze file overlap to decide merge strategy autonomously (do NOT ask the user):
+1. Get changed files of the current PR: `gh pr diff <PR> --name-only`
+2. Get changed files of each earlier PR: `gh pr diff <EARLIER_PR> --name-only`
+3. Check for file intersections across **all** PRs (current + all earlier):
+   - **No shared files between any PRs** → all independent: launch each earlier PR as a background agent (`run_in_background: true`) and proceed with the current PR
+   - **Any shared files between any PRs** → sequential: run `/review-cycle` on the earliest PR first, then the next, until reaching the current PR
 
 ### 2. Request review
 
