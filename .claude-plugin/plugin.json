@@ -1,9 +1,9 @@
 {
-  "name": "review-cycle",
+  "name": "cycle-review",
   "description": "Automated PR review cycle — request review, fix issues, repeat until approved, then merge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": {
     "name": "axisrow"
   },
-  "repository": "https://github.com/axisrow/claude-code-review-cycle-skill"
+  "repository": "https://github.com/axisrow/claude-code-cycle-review-skill"
 }
