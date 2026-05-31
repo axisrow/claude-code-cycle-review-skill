@@ -27,12 +27,16 @@
 #
 # Output (one line per event, plus a FINAL block the caller parses):
 #   EVENT claude done | EVENT claude limit | EVENT codex done | EVENT <r> timeout
+#   EVENT <r> error                    # sustained API outage — fetch failed FETCH_FAIL_MAX ticks
 #   EVENT claude done (resumed)        # already settled in a prior run
 #   FINAL
-#   claude=done|timeout|limit
-#   codex=done|timeout
+#   claude=done|timeout|limit|error
+#   codex=done|timeout|error
 #
 # Exit code is always 0 — the caller reads the FINAL block to decide what to do.
+# `error` means the reviews could NOT be read (not "no findings"): the caller must
+# STOP and NOT merge — never treat it like a clean review. `timeout` is fail-soft
+# (bot was slow, proceed with a warning); `error` is fail-closed (outage, stop).
 # Portable to bash 3.2 (macOS default): no associative arrays, no `mapfile`.
 
 set -uo pipefail
@@ -41,6 +45,10 @@ set -uo pipefail
 : "${REVIEWERS:?set REVIEWERS (e.g. \"claude codex\")}"
 POLL="${POLL:-30}"                 # seconds between ticks
 RESET="${RESET:-0}"                # 1 = discard prior state, start a fresh round
+# Consecutive failed-fetch ticks before we FAIL CLOSED. A single transient blip
+# (network/rate-limit) only burns one tick; only a SUSTAINED outage escalates, so an
+# API failure can never be silently mistaken for "no findings → safe to merge".
+FETCH_FAIL_MAX="${FETCH_FAIL_MAX:-3}"
 
 # Per-reviewer max wait (seconds). Codex is slower than Claude (~5 min vs ~2 min),
 # so it gets a longer ceiling. Override via env if a repo's bots are unusual.
@@ -123,6 +131,25 @@ latest_body() {
      | (last // {}) | .body // ""'
 }
 
+# Fetch a paginated+slurped endpoint, distinguishing FAILURE from empty-but-ok.
+# Prints the flattened JSON array on stdout and signals success/failure via its EXIT
+# CODE (0 = gh succeeded, even on an empty list; 1 = gh itself failed: auth/rate-limit/
+# network). The status MUST be the return code, not a global — callers capture stdout
+# with `X="$(fetch_json …)"`, which runs the body in a subshell where a variable
+# assignment would be invisible to the parent; only the exit code survives `$(…)`.
+# Never use `|| echo '[]'` for this — that is exactly what hides an outage behind an
+# empty array and risks merging unreviewed code.
+#   fetch_json <api-path> [jq-postfilter]
+fetch_json() {
+  local out
+  if out="$(gh api "$1" --paginate --slurp 2>/dev/null)"; then
+    printf '%s' "$out" | jq -c "${2:-add // []}" 2>/dev/null || printf '[]'
+    return 0
+  fi
+  printf '[]'
+  return 1
+}
+
 # Announce reviewers already settled in a prior run (resume path).
 if [ "$RESUMED" = 1 ]; then
   for r in $REVIEWERS; do
@@ -130,6 +157,8 @@ if [ "$RESUMED" = 1 ]; then
     [ -n "$s" ] && echo "EVENT $r $s (resumed)"
   done
 fi
+
+FETCH_FAILS=0   # consecutive failed-fetch ticks; reset on any fully-successful tick
 
 while :; do
   # Short-circuit: if everything is already settled (e.g. fully-resumed run), stop.
@@ -143,15 +172,32 @@ while :; do
   #   - PR inline review comments
   # We merge all three into one flat array. `--paginate` WITHOUT `--slurp` emits each
   # page as a separate JSON array, which breaks `[.[]]|last` (it runs per page); so we
-  # always `--slurp` then `add` to flatten. Reviews use `.submitted_at`, normalized to
-  # `.updated_at` so latest_body's round-scoping filter works uniformly.
-  ISSUE_C="$(gh api "repos/$OWNER/$REPO/issues/$PR/comments" --paginate --slurp 2>/dev/null \
-    | jq -c 'add // []' 2>/dev/null || echo '[]')"
-  REVIEWS="$(gh api "repos/$OWNER/$REPO/pulls/$PR/reviews" --paginate --slurp 2>/dev/null \
-    | jq -c '(add // []) | [.[] | {user, body, updated_at: .submitted_at, created_at: .submitted_at}]' 2>/dev/null || echo '[]')"
-  INLINE_C="$(gh api "repos/$OWNER/$REPO/pulls/$PR/comments" --paginate --slurp 2>/dev/null \
-    | jq -c 'add // []' 2>/dev/null || echo '[]')"
+  # always `--slurp` then `add` to flatten (via fetch_json). Reviews use `.submitted_at`,
+  # normalized to `.updated_at` so latest_body's round-scoping filter works uniformly.
+  # fetch_json signals failure via exit code, so a real outage is distinguished from
+  # "no comments yet" — `$(…)` runs the function in a subshell, where only the exit
+  # code (not a variable) survives. Any failed fetch flips fetch_ok_all to 0.
+  fetch_ok_all=1
+  ISSUE_C="$(fetch_json "repos/$OWNER/$REPO/issues/$PR/comments")"  || fetch_ok_all=0
+  REVIEWS="$(fetch_json "repos/$OWNER/$REPO/pulls/$PR/reviews" \
+    '(add // []) | [.[] | {user, body, updated_at: .submitted_at, created_at: .submitted_at}]')" || fetch_ok_all=0
+  INLINE_C="$(fetch_json "repos/$OWNER/$REPO/pulls/$PR/comments")" || fetch_ok_all=0
   COMMENTS="$(printf '%s\n%s\n%s' "$ISSUE_C" "$REVIEWS" "$INLINE_C" | jq -cs 'add // []' 2>/dev/null || echo '[]')"
+
+  # Fail CLOSED on a SUSTAINED outage. One transient failure only burns a tick; after
+  # FETCH_FAIL_MAX consecutive failures, settle every unsettled reviewer as `error`
+  # (NOT done/timeout) so the caller stops instead of merging unreviewed code.
+  if [ "$fetch_ok_all" = 1 ]; then
+    FETCH_FAILS=0
+  else
+    FETCH_FAILS=$(( FETCH_FAILS + 1 ))
+    if [ "$FETCH_FAILS" -ge "$FETCH_FAIL_MAX" ]; then
+      for r in $REVIEWERS; do is_settled "$r" || settle "$r" error; done
+      break
+    fi
+    sleep "$POLL"; continue   # transient: don't run body checks on a known-bad fetch
+  fi
+
   NOW="$(date +%s)"; ELAPSED=$(( NOW - START ))
 
   for r in $REVIEWERS; do

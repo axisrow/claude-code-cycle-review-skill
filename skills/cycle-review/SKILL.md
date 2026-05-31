@@ -148,7 +148,7 @@ RESET=1 OWNER=<owner> REPO=<repo> PR=<PR> REVIEWERS="<configured>" \
 ```
 Within the same round (a plain resume after an interruption), do NOT pass `RESET` — that would throw away the progress you want to keep.
 
-**Reading its output.** The script streams `EVENT <reviewer> <done|limit|timeout>` lines (a `(resumed)` suffix means that status carried over from a prior run) and ends with a `FINAL` block, then a `STATE <path>` line pointing at the persisted state file:
+**Reading its output.** The script streams `EVENT <reviewer> <done|limit|timeout|error>` lines (a `(resumed)` suffix means that status carried over from a prior run) and ends with a `FINAL` block, then a `STATE <path>` line pointing at the persisted state file:
 ```
 FINAL
 claude=done       # review body contained "Claude finished"
@@ -159,8 +159,9 @@ Possible per-reviewer statuses:
 - `done` → the review is complete; include that bot's comments in triage (step 4).
 - `timeout` → the bot didn't finish within its max wait; take whatever it posted as final and tell the user the review may be incomplete.
 - `limit` (Claude only) → Claude hit its usage cap (its body matched `usage limit` / `Max usage limit` / `rate limit` / `quota`). Handle per step 3.1 below.
+- `error` → a **sustained GitHub API outage** (auth expired, rate-limited, network/TLS failure) prevented the reviews from being read at all — the waiter could not fetch comments for `FETCH_FAIL_MAX` consecutive ticks. This is **not** "no findings". Do **NOT** triage-as-empty and do **NOT** proceed to merge: tell the user the review could not be obtained (and why, e.g. check `gh auth status`) and **stop the cycle**. `error` is fail-closed; `timeout` is fail-soft. Never collapse the two.
 
-When all configured reviewers reach a terminal status the waiter exits; proceed to step 4 using only the comments of reviewers whose status is `done` (or the partial body of a `timeout`ed one).
+When all configured reviewers reach a terminal status the waiter exits. If any reviewer is `error`, stop per the rule above. Otherwise proceed to step 4 using only the comments of reviewers whose status is `done` (or the partial body of a `timeout`ed one).
 
 Optionally, if a single Claude Action workflow run is what you're tracking, `gh run watch <RUN_ID> --exit-status` (via `Bash + dangerouslyDisableSandbox`) is a native blocking watch — but the waiter above already covers review completion and is the default path.
 
@@ -213,7 +214,8 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 - `HALLUCINATION` — show concrete evidence from the codebase (grep results, file contents) that disproves the reviewer's claim
 
 **Decide whether to finalize:**
-- **No `FIX` verdicts** in the triage result → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; the absence of blocking issues IS the approval signal.
+- **Any reviewer status is `error`** (from step 3) → do NOT finalize. A sustained API outage means the review was never actually read, so "no `FIX` verdicts" here is meaningless — it only reflects an empty fetch, not an approval. Notify the user and stop; never let an outage become a silent merge.
+- **No `FIX` verdicts** in the triage result (and no `error`) → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; the absence of blocking issues IS the approval signal.
 - **At least one `FIX`** → proceed to step 5.
 
 ### 5. Fix issues
