@@ -1,7 +1,7 @@
 {
   "name": "cycle-review",
   "description": "Automated PR review cycle — request review, fix issues, repeat until approved, then merge",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "author": {
     "name": "axisrow"
   },

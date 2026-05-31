@@ -2,8 +2,8 @@
 name: cycle-review
 description: Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Aliased as /cr.
 disable-model-invocation: true
-allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent
-argument-hint: "[pr-numbers...]"
+allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
+argument-hint: "[pr-numbers...] [--reconfigure]"
 ---
 
 # Cycle Review
@@ -12,9 +12,63 @@ Automated PR review cycle until full approval, with multi-PR merge strategy plan
 
 PR numbers come from `$ARGUMENTS`. Parse them as a free-form string — accept any format (space-separated, comma-separated, prose like "twenty, twenty-one and twenty-five"). If `$ARGUMENTS` is empty — auto-detect the current PR from the branch via `gh pr view --json number -q .number`. Other authors' PRs are never included automatically; the user must pass their numbers explicitly.
 
+If `$ARGUMENTS` contains the flag `--reconfigure` (or `--onboard`), strip it out before parsing PR numbers and force the onboarding in step 0 to run again, overwriting the saved config.
+
 ## Cycle
 
-Repeat steps 2–6 until the PR has no `FIX` verdicts, then run step 7 (CI) and step 8 (merge).
+Run step 0 (onboarding) once at the start of every invocation, then repeat steps 2–6 until the PR has no `FIX` verdicts, then run step 7 (CI) and step 8 (merge).
+
+### 0. Onboarding — which reviewers are available (run once per invocation)
+
+The skill needs to know which review bots the user actually has installed: `@claude`, `@codex`, or both. This drives who gets pinged in step 2 and whose comments/finish-markers we wait for in step 3.
+
+**Config location (global, per user):** `~/.claude/cycle-review/config.json`. It is intentionally global — not committed into the reviewed repo, set once, reused across all projects.
+
+**Schema:**
+```json
+{
+  "reviewers": ["@claude", "@codex"],
+  "version": 1
+}
+```
+`reviewers` is a non-empty array of mention handles. Valid handles are `@claude` and `@codex`. Order does not matter.
+
+**Flow:**
+
+1. Decide whether onboarding is needed. It is needed when `--reconfigure` was passed OR the config is missing/invalid. Detect a valid config with:
+   ```bash
+   CONFIG_FILE="$HOME/.claude/cycle-review/config.json"
+   jq -e '.reviewers | type == "array" and length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
+     && echo CONFIGURED || echo NEEDS_ONBOARDING
+   ```
+   `CONFIGURED` → read the reviewers (next step's read command) and skip to step 1. `NEEDS_ONBOARDING` (missing file, malformed JSON, or empty `reviewers`) → run onboarding.
+
+2. **Run onboarding.** Ask the user which review bots they have, using the `AskUserQuestion` tool — a single question, multi-select, with options `@claude`, `@codex` (the user may pick one or both). Do not free-text-parse this; use the structured picker.
+
+3. **Persist the choice.** Build the file with `jq -n` so the JSON is always well-formed (never hand-concatenate strings). Example for "both":
+   ```bash
+   CONFIG_DIR="$HOME/.claude/cycle-review"
+   CONFIG_FILE="$CONFIG_DIR/config.json"
+   mkdir -p "$CONFIG_DIR"
+   jq -n '{reviewers: ["@claude", "@codex"], version: 1}' > "$CONFIG_FILE"
+   ```
+   For a single reviewer, pass a one-element array, e.g. `'{reviewers: ["@claude"], version: 1}'` or `'{reviewers: ["@codex"], version: 1}'`. Confirm to the user what was saved and where.
+
+4. **Read the active reviewers** (always, whether freshly onboarded or already configured) into a list used by steps 2–3:
+   ```bash
+   jq -r '.reviewers[]' "$HOME/.claude/cycle-review/config.json"
+   ```
+
+**Where each reviewer posts** (useful for triage in step 4 — the step-3 waiter ignores this and just waits a fixed window):
+
+| Handle | Mention (step 2) | Bot login | Where its review lands |
+|---|---|---|---|
+| `@claude` | `@claude` | `claude[bot]` | edits a single **issue comment** in place; finishes with the marker `Claude finished` |
+| `@codex` | `@codex` | `chatgpt-codex-connector[bot]` | a **PR review** object plus **inline review comments** (not issue comments) |
+
+**Timing.** Claude usually finishes in ~2 min, Codex in ~5 min. The step-3 waiter uses one fixed window (`WAIT`, default 5 min) that covers both — no per-reviewer clocks.
+
+The `@codex` bot login is a best-effort default and can vary by integration. On the first real Codex run, verify the actual login via `gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[].user.login] | unique'` (and `pulls/{PR}/reviews`), and if it differs, tell the user and use the observed value for that session.
 
 ### 1. Multi-PR strategy (run once per invocation)
 
@@ -57,70 +111,68 @@ Skip this step only when there is exactly one PR to handle (single-PR run, no ot
 
 ### 2. Request review
 
-Leave a comment on the PR instructing the reviewer to focus on significant issues:
+Ping **all configured reviewers in a single comment** — concatenate every configured mention, space-separated, at the start of the body. The mention string depends on the active reviewers list from step 0:
+
+| Configured reviewers | Mention string `<MENTIONS>` |
+|---|---|
+| both `@claude` and `@codex` | `@claude @codex` |
+| only `@claude` | `@claude` |
+| only `@codex` | `@codex` |
+
+Then post one comment:
 ```
-gh pr comment <PR> --body "@claude review. Focus on critical issues: bugs, security vulnerabilities, logical errors, data loss risks, performance problems. Do NOT nitpick style, naming conventions, minor formatting, or subjective preferences — only flag issues that could break functionality or cause real harm in production."
+gh pr comment <PR> --body "<MENTIONS> review. Focus on critical issues: bugs, security vulnerabilities, logical errors, data loss risks, performance problems. Do NOT nitpick style, naming conventions, minor formatting, or subjective preferences — only flag issues that could break functionality or cause real harm in production."
 ```
+For example, with both configured the body starts with `@claude @codex review.`; with only Codex it starts with `@codex review.`. Run via `Bash` with `dangerouslyDisableSandbox: true`.
 
 ### 3. Wait for reviewer response
 
-The naive `Bash("sleep N && gh ...")` pattern is blocked by the runtime, and `Monitor` cannot reach `api.github.com` because it runs sandboxed. Use one of the two strategies below.
+Give the bots a fixed window to respond, then move on. The waiter does **not** try to
+detect "who finished" — that's triage's job (step 4 reads every comment and decides).
+It just waits, then confirms the API is reachable so an outage can't masquerade as
+"no findings".
 
-**Primary — `gh run watch`** (preferred when the Claude Action workflow is detectable):
-```
-RUN_ID=$(gh run list --limit 1 --json databaseId,headBranch,status \
-  --jq "[.[] | select(.headBranch==\"<branch>\")] | .[0].databaseId")
-gh run watch "$RUN_ID" --exit-status
-```
-Run via `Bash` with `dangerouslyDisableSandbox: true`. `gh run watch` is a native blocking watch — no custom loop needed.
-
-**Fallback — comment polling by ID** (when no workflow is found, e.g. Claude Action disabled or not yet started):
-
-#### 3.1. Find the bot's comment
-After ~120 seconds (reviewers rarely finish in under 2 minutes), fetch issue comments and find the latest one from `claude[bot]`:
+Run the committed driver `wait-for-reviews.sh` (beside this `SKILL.md`) via `Bash` with
+**both** `run_in_background: true` and `dangerouslyDisableSandbox: true` — the sandbox
+blocks TLS to api.github.com, and a *leading* `sleep N && …` is blocked by the runtime,
+but the `sleep` *inside* this backgrounded script is fine:
 ```bash
-gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | select(.user.login == "claude[bot]")] | last | {id, created_at, body}'
+OWNER=<owner> REPO=<repo> PR=<PR> WAIT=300 \
+  bash "<path-to-skill-dir>/wait-for-reviews.sh"
 ```
-Save the `COMMENT_ID` and `created_at` timestamp. If no comment — wait 30 more seconds and retry (max 3 attempts). Still nothing → notify the user and stop.
+- `WAIT` defaults to 300s (5 min), which covers Codex (~5 min) and Claude (~2 min). Raise
+  it for unusually slow bots.
+- The script prints exactly **one** line:
+  - `DONE` → the window elapsed and the API is reachable. Proceed to step 4 and triage
+    whatever comments exist.
+  - `ERROR <reason>` → the PR's comments could not be read after several tries (a sustained
+    API outage — expired auth, rate limit, network). This is **not** "no findings". Stop
+    the cycle, tell the user (e.g. check `gh auth status`), and do **not** merge.
 
-To wait those 120/30 seconds without `sleep N && ...`, run the lookup in a background loop with both `run_in_background: true` AND `dangerouslyDisableSandbox: true`:
-```bash
-until gh api repos/{owner}/{repo}/issues/{PR}/comments \
-  --jq '[.[] | select(.user.login=="claude[bot]")] | length' | grep -q -v '^0$'; do sleep 30; done
-```
-
-#### 3.2. Poll the comment body
-Every 30 seconds, check the comment body:
-```bash
-gh api repos/{owner}/{repo}/issues/comments/{COMMENT_ID} --jq '.body'
-```
-The review is complete when the body contains the string `Claude finished` (the progress checklist with checkboxes disappears at that point). Run the polling loop in the background, same flags.
-
-#### 3.3. Timeout
-Maximum wait: 7 minutes from the comment's `created_at`. If `Claude finished` hasn't appeared by then — take the current body as final and proceed to step 4. Notify the user that the review may be incomplete.
+There is no per-reviewer status, no state file, and nothing to resume — each new round just
+posts a fresh request (step 2) and runs the waiter again. If the background run is lost,
+re-run the same command; a fresh wait is harmless.
 
 **Anti-patterns — do NOT use:**
-- `Bash("sleep 120 && gh ...")` — leading `sleep` is blocked by the runtime.
+- `Bash("sleep 120 && gh ...")` — a *leading* `sleep` is blocked by the runtime. The `sleep` inside the backgrounded waiter is fine.
 - `Bash("sleep 60 && sleep 60 && ...")` — chained short sleeps are blocked too.
 - `Monitor("until gh api ...; do sleep 30; done")` — `gh api` fails inside the sandbox because of TLS interception.
 - Any `gh ...` call without `dangerouslyDisableSandbox: true`.
-
-**Decision table:**
-
-| What we wait for | Tool |
-|---|---|
-| GitHub Actions workflow finishes | `gh run watch` via `Bash + dangerouslyDisableSandbox` |
-| New `claude[bot]` comment / `Claude finished` marker | `Bash + run_in_background + dangerouslyDisableSandbox` with until-loop |
-| Just "N seconds" with no condition | `ScheduleWakeup`, not `sleep` |
 
 ### 4. Analyze and triage comments
 
 Read all comments and review comments from **all reviewers** (bot and human). Fetch both issue comments and PR review comments:
 ```bash
+# Issue comments (Claude edits its single one here):
 gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.login, body, created_at}]'
+# PR review objects — body/state/author (Codex posts its review summary here):
 gh pr view <PR> --json reviews --jq '.reviews'
+# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and
+# Claude's inline notes) post actionable issues HERE, and `gh pr view --json reviews`
+# does NOT return them. Miss this surface and a real FIX is silently skipped before merge:
+gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq '[.[] | {id, user: .user.login, path, line, body, created_at}]'
 ```
-Process comments from every reviewer, not just `claude[bot]`.
+Process comments from **all three surfaces** and from every reviewer, not just `claude[bot]`. An inline review comment with an actionable finding is a first-class triage input, exactly like an issue comment.
 
 Launch a subagent (Agent tool) to triage each comment. The subagent must:
 - Read the current code of files referenced in the comments
@@ -138,8 +190,10 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 - `CONFLICTING` — quote the contradicting previous comment and ask the reviewer to clarify
 - `HALLUCINATION` — show concrete evidence from the codebase (grep results, file contents) that disproves the reviewer's claim
 
-**Decide whether to finalize:**
-- **No `FIX` verdicts** in the triage result → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; the absence of blocking issues IS the approval signal.
+**Decide whether to finalize** — check these in order:
+- **Step 3 returned `ERROR`** → do NOT finalize. The comments could not be read (a sustained API outage), so an empty triage is meaningless, not approval. Notify the user and stop; never let an outage become a silent merge.
+- **No reviewer was actually heard from this round** → do NOT finalize. If the configured bots posted nothing new for this round (the bots were slow, or Claude shows a usage-limit message instead of a review and no other reviewer responded), then no review happened — "no `FIX` verdicts" only reflects silence, not an approval. Treat a Claude usage-limit message as "Claude did not review" (not a finding). If Codex is configured and reviewed, you may proceed on Codex alone; if nobody reviewed, notify the user and stop. This must be checked BEFORE interpreting the absence of `FIX` verdicts.
+- **No `FIX` verdicts**, and at least one reviewer actually reviewed → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal.
 - **At least one `FIX`** → proceed to step 5.
 
 ### 5. Fix issues
@@ -152,7 +206,7 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 ### 6. Commit and push
 - Commit fixes with a meaningful message (conventional commits style)
 - Push to remote
-- Return to step 2
+- Return to step 2. This begins a **new review round**: post a fresh review request, then run the step-3 waiter again (it always waits a clean fixed window — nothing to reset).
 
 ### 7. Check CI before merge
 
@@ -186,9 +240,13 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - return to step 2 with the next PR.
 
 ## Important
+- Reviewers are configured once via onboarding (step 0) and stored globally at `~/.claude/cycle-review/config.json`. Re-run onboarding with the `--reconfigure` flag. Never hardcode `@claude` — always drive steps 2–3 from the configured reviewers list.
+- When both reviewers are configured, ping them in **one** comment whose body starts with `@claude @codex`. With a single reviewer, use just that mention.
+- Codex is slower than Claude (~5 min vs ~2 min): use the per-reviewer initial wait / max wait from the step 0 table, never Claude's window for Codex.
+- If Claude hits its usage limit (step 3.4): when Codex is configured, drop Claude for this run and continue on Codex; when Codex is not configured, just notify the user the limit is exhausted and stop — do **not** wait for the limit to reset.
 - All `gh` commands (and any other GitHub API calls) must be run via Bash with `dangerouslyDisableSandbox: true`, as the sandbox blocks TLS connections to api.github.com
 - Do not skip critical comments — fix all with the `FIX` verdict. Cosmetic comments (`SKIP`) can be skipped with a reply
 - Every commit must have a meaningful message following conventional commits style
 - Run lint and tests before every commit
 - If tests fail after fixes — fix them before pushing
-- If `gh run watch` finds no run id and the fallback comment polling makes no progress after 3 attempts — notify the user and stop: the reviewer bot may be misconfigured or unavailable
+- Never merge without a real review. Finalize only if at least one configured reviewer actually posted a review this round (see the finalize gate in step 4). If the bots stayed silent, or Claude only showed a usage-limit message and no one else reviewed, or step 3 returned `ERROR` (a sustained API outage) — notify the user and stop. An empty triage from silence or an outage is not an approval.
