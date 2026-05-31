@@ -31,8 +31,8 @@ This sets up the GitHub App and CI so Claude Code can review code and edit comme
 ## Usage
 
 ```
-/cycle-review [pr-numbers...] [--reconfigure]
-/cr           [pr-numbers...] [--reconfigure]
+/cycle-review [pr-numbers...] [onboard]
+/cr           [pr-numbers...] [onboard]
 ```
 
 Both forms are equivalent — `/cr` is a short alias.
@@ -54,11 +54,13 @@ On **first run** the skill asks which review bots you have installed: `@claude`,
 }
 ```
 
-From then on the skill silently uses this list: it pings each configured reviewer in the review-request step and waits for each of them to respond. To change the choice later, run with the `--reconfigure` flag:
+From then on the skill silently uses this list: it pings each configured reviewer in the review-request step and waits for each of them to respond. To change the choice later, run the short command:
 
 ```
-/cr --reconfigure
+/cr onboard
 ```
+
+The legacy `--onboard` and `--reconfigure` forms remain supported.
 
 The file is global (not in the reviewed repo), so it never clutters your projects and is reused across all repositories.
 
@@ -68,7 +70,7 @@ The skill runs an onboarding step plus an 8-step automated loop:
 
 ### 0. Reviewer onboarding (one-time)
 
-When no config exists (or `--reconfigure` is passed), asks which bots are available (`@claude` / `@codex` / both) and saves the choice to `~/.claude/cycle-review/config.json`. If a config already exists, this step is skipped.
+When no config exists (or `onboard` is passed), asks which bots are available (`@claude` / `@codex` / both) and saves the choice to `~/.claude/cycle-review/config.json`. If a config already exists, this step is skipped.
 
 ### 1. Multi-PR strategy
 
@@ -123,7 +125,7 @@ When approved with no outstanding comments and CI green — squash-merge and cle
 
 ## Key Features
 
-- **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `--reconfigure`
+- **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `/cr onboard`
 - **Unified, body-based waiting** — one committed driver reads all bot comments each tick and detects completion by comment body, so Claude's in-place comment edits never cause the count-based hang
 - **Resumable waiting** — wait state is persisted per PR, so an interrupted cycle continues where it left off instead of restarting the wait from scratch
 - **Per-reviewer timing** — knows Codex is slower than Claude (~5 min vs ~2 min) and waits on each reviewer's own schedule

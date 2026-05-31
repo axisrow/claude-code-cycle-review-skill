@@ -3,7 +3,7 @@ name: cycle-review
 description: Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Aliased as /cr.
 disable-model-invocation: true
 allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
-argument-hint: "[pr-numbers...] [--reconfigure]"
+argument-hint: "[pr-numbers...] [onboard]"
 ---
 
 # Cycle Review
@@ -12,7 +12,7 @@ Automated PR review cycle until full approval, with multi-PR merge strategy plan
 
 PR numbers come from `$ARGUMENTS`. Parse them as a free-form string — accept any format (space-separated, comma-separated, prose like "twenty, twenty-one and twenty-five"). If `$ARGUMENTS` is empty — auto-detect the current PR from the branch via `gh pr view --json number -q .number`. Other authors' PRs are never included automatically; the user must pass their numbers explicitly.
 
-If `$ARGUMENTS` contains the flag `--reconfigure` (or `--onboard`), strip it out before parsing PR numbers and force the onboarding in step 0 to run again, overwriting the saved config.
+If `$ARGUMENTS` contains the standalone command token `onboard`, or the legacy flags `--onboard` / `--reconfigure`, strip that token out before parsing PR numbers and force the onboarding in step 0 to run again, overwriting the saved config. Treat `onboard` as the preferred user-facing form, e.g. `/cr onboard`.
 
 ## Cycle
 
@@ -35,7 +35,7 @@ The skill needs to know which review bots the user actually has installed: `@cla
 
 **Flow:**
 
-1. Decide whether onboarding is needed. It is needed when `--reconfigure` was passed OR the config is missing/invalid. Detect a valid config with:
+1. Decide whether onboarding is needed. It is needed when `onboard`, `--onboard`, or `--reconfigure` was passed OR the config is missing/invalid. Detect a valid config with:
    ```bash
    CONFIG_FILE="$HOME/.claude/cycle-review/config.json"
    jq -e '.reviewers | type == "array" and length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
@@ -240,7 +240,7 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - return to step 2 with the next PR.
 
 ## Important
-- Reviewers are configured once via onboarding (step 0) and stored globally at `~/.claude/cycle-review/config.json`. Re-run onboarding with the `--reconfigure` flag. Never hardcode `@claude` — always drive steps 2–3 from the configured reviewers list.
+- Reviewers are configured once via onboarding (step 0) and stored globally at `~/.claude/cycle-review/config.json`. Re-run onboarding with `/cr onboard` (legacy: `--onboard` or `--reconfigure`). Never hardcode `@claude` — always drive steps 2–3 from the configured reviewers list.
 - When both reviewers are configured, ping them in **one** comment whose body starts with `@claude @codex`. With a single reviewer, use just that mention.
 - Codex is slower than Claude (~5 min vs ~2 min): use the per-reviewer initial wait / max wait from the step 0 table, never Claude's window for Codex.
 - If Claude hits its usage limit (step 3.4): when Codex is configured, drop Claude for this run and continue on Codex; when Codex is not configured, just notify the user the limit is exhausted and stop — do **not** wait for the limit to reset.
