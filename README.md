@@ -2,7 +2,7 @@
 
 > [Русская версия](README.ru.md)
 
-Automated PR review cycle for Claude Code. Plans a merge strategy when several PRs are open, requests a code review, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval — then squash-merges.
+Automated PR review cycle for Claude Code. On first run it asks which review bots you have (`@claude`, `@codex`, or both). Plans a merge strategy when several PRs are open, requests a code review from every configured reviewer, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval — then squash-merges.
 
 ## Installation
 
@@ -15,7 +15,8 @@ cp -r claude-code-cycle-review-skill/commands ~/.claude/
 ### Prerequisites
 
 - [GitHub CLI](https://cli.github.com/) (`gh`) authenticated with your account
-- Claude Code with GitHub Actions reviewer (`claude[bot]`) or any other PR reviewer
+- [`jq`](https://jqlang.github.io/jq/) — for reading and writing the onboarding config
+- Claude Code with GitHub Actions reviewer (`claude[bot]`), Codex (`@codex`), or any other PR reviewer
 
 ### Setup
 
@@ -30,17 +31,44 @@ This sets up the GitHub App and CI so Claude Code can review code and edit comme
 ## Usage
 
 ```
-/cycle-review [pr-numbers...]
-/cr           [pr-numbers...]
+/cycle-review [pr-numbers...] [--reconfigure]
+/cr           [pr-numbers...] [--reconfigure]
 ```
 
 Both forms are equivalent — `/cr` is a short alias.
 
 If no PR numbers are provided, the skill auto-detects the current PR from the branch and additionally enumerates your other open PRs to plan a merge strategy. Numbers can be passed in any free-form format (`/cr 20 21 25`, `/cr 20, 21, 25`, etc.). Other authors' PRs are never auto-included; pass them explicitly to opt in.
 
+## Reviewer onboarding
+
+On **first run** the skill asks which review bots you have installed: `@claude`, `@codex`, or both. The choice is stored globally (once per user) at:
+
+```
+~/.claude/cycle-review/config.json
+```
+
+```json
+{
+  "reviewers": ["@claude", "@codex"],
+  "version": 1
+}
+```
+
+From then on the skill silently uses this list: it pings each configured reviewer in the review-request step and waits for each of them to respond. To change the choice later, run with the `--reconfigure` flag:
+
+```
+/cr --reconfigure
+```
+
+The file is global (not in the reviewed repo), so it never clutters your projects and is reused across all repositories.
+
 ## How It Works
 
-The skill runs an 8-step automated loop:
+The skill runs an onboarding step plus an 8-step automated loop:
+
+### 0. Reviewer onboarding (one-time)
+
+When no config exists (or `--reconfigure` is passed), asks which bots are available (`@claude` / `@codex` / both) and saves the choice to `~/.claude/cycle-review/config.json`. If a config already exists, this step is skipped.
 
 ### 1. Multi-PR strategy
 
@@ -48,14 +76,19 @@ When several of your PRs are open, the skill maps file overlaps and PR stacks, t
 
 ### 2. Request review
 
-Posts a comment on the PR asking the reviewer to focus on critical issues only (bugs, security, logic errors, data loss, performance). Cosmetic nitpicks are explicitly discouraged.
+Pings **all configured reviewers in a single comment** — the body starts with every configured mention (`@claude @codex` when both are on, or just one), asking them to focus on critical issues only (bugs, security, logic errors, data loss, performance). Cosmetic nitpicks are explicitly discouraged.
 
 ### 3. Wait for reviewer response
 
-Sandbox-aware waiting:
-- **Primary**: `gh run watch` — a native blocking watch on the Claude Action workflow, no custom loop needed.
-- **Fallback**: comment polling by ID — finds the latest `claude[bot]` comment, polls every 30s for the `Claude finished` marker. Runs in the background to avoid blocked `sleep N && ...` patterns.
-- Timeout: 7 minutes from comment creation.
+Waiting is handled by **one unified driver** (`skills/cycle-review/wait-for-reviews.sh`) instead of an ad-hoc loop reinvented each run. Every tick it `sleep`s, re-reads **all** comments from **all** bots, and detects completion from each bot's latest comment **body** — never from a comment count.
+
+- **Why body, not count**: Claude **always edits its single comment in place** rather than posting a new one. A count-based wait ("until the bot has more than one comment") therefore hangs forever — the exact bug that once stalled a PR. The body check (`Claude finished`) handles the in-place edit correctly.
+- **Idempotent per PR**: the wait state is persisted (keyed by `owner/repo/PR`). If the loop is interrupted — a turn boundary, context compaction, a lost background task — re-running the same command **resumes** instead of restarting: reviewers already settled aren't re-awaited and the timeout counts from the original start. A `RESET=1` flag begins a fresh wait for the next review round.
+- **Per-reviewer timing** (Codex is slower, ~5 min vs ~2 min): Claude times out at 7 min, Codex at 12 min. Poll interval 30s. All configurable via env.
+- **Codex completion**: a settled review/comment appearing instead of a progress placeholder.
+- **Claude usage limit**: if Claude's review fails because the account hit its usage cap, then — if Codex is configured — the run drops Claude and continues on Codex only; if Codex is not configured, it notifies you that the limit is exhausted and stops (it never waits for the limit to reset).
+
+Run via the background, sandbox-disabled `Bash` (the GitHub API isn't reachable from the sandbox); a leading `sleep N && …` is blocked, but the `sleep` *inside* the driver loop is fine.
 
 ### 4. Analyze and triage comments
 
@@ -90,6 +123,11 @@ When approved with no outstanding comments and CI green — squash-merge and cle
 
 ## Key Features
 
+- **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `--reconfigure`
+- **Unified, body-based waiting** — one committed driver reads all bot comments each tick and detects completion by comment body, so Claude's in-place comment edits never cause the count-based hang
+- **Resumable waiting** — wait state is persisted per PR, so an interrupted cycle continues where it left off instead of restarting the wait from scratch
+- **Per-reviewer timing** — knows Codex is slower than Claude (~5 min vs ~2 min) and waits on each reviewer's own schedule
+- **Claude usage-limit fallback** — if Claude hits its usage cap, continues on Codex when configured, otherwise notifies and stops without waiting for the limit to reset
 - **Multi-PR planning** — detects file overlap and PR stacks, picks merge order
 - **Sandbox-aware waiting** — uses `gh run watch` and background polling; never relies on blocked `sleep N && ...` patterns
 - **Smart polling** — tracks the reviewer's comment by ID instead of waiting a fixed time

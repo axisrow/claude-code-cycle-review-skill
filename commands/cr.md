@@ -1,9 +1,9 @@
 ---
 description: Alias for /cycle-review — automated PR review cycle (request review, triage, fix, merge)
-argument-hint: "[pr-numbers...]"
+argument-hint: "[pr-numbers...] [--reconfigure]"
 allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent
 ---
 
 Run the `cycle-review` skill with these arguments: $ARGUMENTS
 
-Follow the full procedure defined in `skills/cycle-review/SKILL.md` exactly — multi-PR strategy planning (step 0), review request, waiting via `gh run watch`, comment triage, fixes, commit/push, and finalization. Do not invent shortcuts: this command exists only as a short alias for `/cycle-review`.
+Follow the full procedure defined in `skills/cycle-review/SKILL.md` exactly — reviewer onboarding (step 0, one-time, stored at `~/.claude/cycle-review/config.json`; pass `--reconfigure` to redo it), multi-PR strategy planning (step 1), review request to every configured reviewer, waiting via `gh run watch`, comment triage, fixes, commit/push, and finalization. Do not invent shortcuts: this command exists only as a short alias for `/cycle-review`.
