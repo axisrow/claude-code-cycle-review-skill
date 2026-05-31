@@ -59,16 +59,16 @@ The skill needs to know which review bots the user actually has installed: `@cla
    jq -r '.reviewers[]' "$HOME/.claude/cycle-review/config.json"
    ```
 
-**Per-reviewer parameters** (used by steps 2–3). Each configured reviewer maps to:
+**Where each reviewer posts** (useful for triage in step 4 — the step-3 waiter ignores this and just waits a fixed window):
 
-| Handle | Mention (step 2) | Bot login — comment author (step 3 fallback) | Finish marker (step 3 fallback) | Initial wait | Max wait |
-|---|---|---|---|---|---|
-| `@claude` | `@claude` | `claude[bot]` | `Claude finished` | ~120s | 7 min |
-| `@codex` | `@codex` | `chatgpt-codex-connector[bot]` | review posted (a non-progress review/comment appears) | ~300s | 12 min |
+| Handle | Mention (step 2) | Bot login | Where its review lands |
+|---|---|---|---|
+| `@claude` | `@claude` | `claude[bot]` | edits a single **issue comment** in place; finishes with the marker `Claude finished` |
+| `@codex` | `@codex` | `chatgpt-codex-connector[bot]` | a **PR review** object plus **inline review comments** (not issue comments) |
 
-**Timing — Codex is slower than Claude.** Claude usually finishes a review in ~2 minutes; Codex typically takes ~5 minutes, so its timeout is longer (12 min vs 7 min). These ceilings are baked into the step 3 waiter (`CLAUDE_MAX` / `CODEX_MAX`); using Claude's tighter window for Codex would falsely time it out while it is still working. When both are configured, each waits on its own schedule.
+**Timing.** Claude usually finishes in ~2 min, Codex in ~5 min. The step-3 waiter uses one fixed window (`WAIT`, default 5 min) that covers both — no per-reviewer clocks.
 
-The `@claude` row is confirmed. The `@codex` bot login and finish marker are best-effort defaults — Codex's exact comment-author login and completion signal can vary by integration. On the first real Codex run, verify the actual login via `gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[].user.login] | unique'` and, if it differs, tell the user and use the observed value for that session.
+The `@codex` bot login is a best-effort default and can vary by integration. On the first real Codex run, verify the actual login via `gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[].user.login] | unique'` (and `pulls/{PR}/reviews`), and if it differs, tell the user and use the observed value for that session.
 
 ### 1. Multi-PR strategy (run once per invocation)
 
@@ -127,71 +127,37 @@ For example, with both configured the body starts with `@claude @codex review.`;
 
 ### 3. Wait for reviewer response
 
-**Use ONE waiter for every case — do not invent a new loop each time.** Run the committed driver `wait-for-reviews.sh`, which sits **next to this `SKILL.md`** (in the installed skill directory — typically `~/.claude/skills/cycle-review/wait-for-reviews.sh`). It is the single source of truth for waiting: every tick it `sleep`s, re-fetches **all** comments from **all** bots, and decides completion from each bot's **latest comment body** — never from a comment count or "a new comment appeared".
+Give the bots a fixed window to respond, then move on. The waiter does **not** try to
+detect "who finished" — that's triage's job (step 4 reads every comment and decides).
+It just waits, then confirms the API is reachable so an outage can't masquerade as
+"no findings".
 
-> **Why a body check, never a count.** Claude **always edits its one existing comment in place** — it never posts a second one. So any condition like "wait until the bot has more than one comment" (`… | length > 1`) hangs forever: the count stays 1 even after the review is done. This exact bug stalled PR #642. The waiter only ever looks at the body for the `Claude finished` marker, so an in-place edit is detected correctly.
-
-**How to run it** — via `Bash` with **both** `run_in_background: true` and `dangerouslyDisableSandbox: true` (the sandbox blocks TLS to api.github.com; a leading `sleep N && …` is blocked, but a `sleep` *inside* this loop is fine). Resolve the path relative to this skill (the `wait-for-reviews.sh` beside this file):
+Run the committed driver `wait-for-reviews.sh` (beside this `SKILL.md`) via `Bash` with
+**both** `run_in_background: true` and `dangerouslyDisableSandbox: true` — the sandbox
+blocks TLS to api.github.com, and a *leading* `sleep N && …` is blocked by the runtime,
+but the `sleep` *inside* this backgrounded script is fine:
 ```bash
-OWNER=<owner> REPO=<repo> PR=<PR> REVIEWERS="<configured>" \
+OWNER=<owner> REPO=<repo> PR=<PR> WAIT=300 \
   bash "<path-to-skill-dir>/wait-for-reviews.sh"
 ```
-- `REVIEWERS` is the space-separated set from step 0 with the leading `@` stripped — `"claude codex"`, `"claude"`, or `"codex"`. The waiter waits for exactly those.
-- Per-reviewer timing is built in (Codex is slower): Claude max wait 7 min, Codex 12 min. Override with `CLAUDE_MAX` / `CODEX_MAX` (seconds) only if a repo's bots behave unusually. Poll interval defaults to 30s (`POLL`).
+- `WAIT` defaults to 300s (5 min), which covers Codex (~5 min) and Claude (~2 min). Raise
+  it for unusually slow bots.
+- The script prints exactly **one** line:
+  - `DONE` → the window elapsed and the API is reachable. Proceed to step 4 and triage
+    whatever comments exist.
+  - `ERROR <reason>` → the PR's comments could not be read after several tries (a sustained
+    API outage — expired auth, rate limit, network). This is **not** "no findings". Stop
+    the cycle, tell the user (e.g. check `gh auth status`), and do **not** merge.
 
-**Idempotent per PR — resume, never restart.** The waiter persists its state to `~/.claude/cycle-review/state/<owner>__<repo>__pr<PR>.json` (the original start time + which reviewers already settled). If the loop is interrupted — turn boundary, context compaction, a manual stop, or the background task being lost — **just run the exact same command again**. It resumes: a reviewer already `done`/`limit`/`timeout` in a prior run is not re-awaited (you'll see `EVENT <r> <status> (resumed)`), and the timeout clock counts from the *original* start, not the restart. This is the fix for the old "the run-id is in a background task, please continue waiting from scratch" pain — never re-launch a fresh wait by hand; re-run the same waiter and it picks up where it left off.
-
-**Start a fresh round after pushing fixes.** Each new review round (you applied fixes in step 5, committed/pushed in step 6, and re-requested review in step 2) needs a clean wait — otherwise the previous round's `done` would short-circuit it. Pass `RESET=1` on the **first** waiter call of each new round to wipe that PR's state:
-```bash
-RESET=1 OWNER=<owner> REPO=<repo> PR=<PR> REVIEWERS="<configured>" \
-  bash "<path-to-skill-dir>/wait-for-reviews.sh"
-```
-Within the same round (a plain resume after an interruption), do NOT pass `RESET` — that would throw away the progress you want to keep.
-
-**Safety net — the waiter auto-invalidates stale state.** Even if you forget `RESET=1`, the waiter compares the saved `start_iso` against the server timestamp of the latest review-request comment. If a newer request was posted since the saved wait (a new round, or a brand-new invocation that re-requested review in step 2), the old `done`/`timeout` statuses belong to a *previous* request, so the waiter discards them and starts fresh (you'll see `EVENT all reset (new review request since last wait)`). This prevents a prior run's completed/aborted status from making the waiter emit `(resumed)` and skip the freshly-requested review — which could otherwise let the cycle proceed to merge without ever reading a review for the current request. A genuine resume within the same round (same request → same timestamp) is unaffected and still resumes.
-
-**Reading its output.** The script streams `EVENT <reviewer> <done|limit|timeout|error>` lines (a `(resumed)` suffix means that status carried over from a prior run) and ends with a `FINAL` block, then a `STATE <path>` line pointing at the persisted state file:
-```
-FINAL
-claude=done       # review body contained "Claude finished"
-codex=done        # a settled (non-progress) Codex review appeared
-STATE /Users/you/.claude/cycle-review/state/acme__widgets__pr642.json
-```
-Possible per-reviewer statuses:
-- `done` → the review is complete; include that bot's comments in triage (step 4).
-- `timeout` → the bot didn't finish within its max wait; take whatever it posted as final and tell the user the review may be incomplete.
-- `limit` (Claude only) → Claude hit its usage cap (its body matched `usage limit` / `Max usage limit` / `rate limit` / `quota`). Handle per step 3.1 below.
-- `error` → a **sustained GitHub API outage** (auth expired, rate-limited, network/TLS failure) prevented the reviews from being read at all — the waiter could not fetch comments for `FETCH_FAIL_MAX` consecutive ticks. This is **not** "no findings". Do **NOT** triage-as-empty and do **NOT** proceed to merge: tell the user the review could not be obtained (and why, e.g. check `gh auth status`) and **stop the cycle**. `error` is fail-closed; `timeout` is fail-soft. Never collapse the two.
-
-When all configured reviewers reach a terminal status the waiter exits. Then apply this **positive completion gate** before doing anything else:
-- If any reviewer is `error` → stop (sustained outage; see above).
-- **At least one configured reviewer must be `done`** to proceed. `done` is the only status that means a review was actually read. If NO reviewer is `done` — i.e. every configured reviewer is some combination of `timeout` / `limit` (e.g. `claude=limit` + `codex=timeout`, where neither the all-`timeout` guard nor the `error` guard fires) — then no review ever completed, triage would be empty, and proceeding would merge unreviewed. **Stop and notify the user** instead. Do not treat "no `error` and no `FIX`" as approval when the real reason is that nobody finished.
-- Otherwise (≥1 `done`) → proceed to step 4 using the comments of every `done` reviewer (plus the partial body of any `timeout`ed one, as best-effort context only).
-
-Optionally, if a single Claude Action workflow run is what you're tracking, `gh run watch <RUN_ID> --exit-status` (via `Bash + dangerouslyDisableSandbox`) is a native blocking watch — but the waiter above already covers review completion and is the default path.
-
-#### 3.1. Claude usage-limit handling
-When the waiter reports `claude=limit`, branch on whether `@codex` is in the configured reviewers list:
-- **Codex is configured** → do NOT wait for Claude's limit to reset. Notify the user that Claude hit its usage limit and that this run continues on Codex only, then drop Claude from triage and proceed **only once Codex's status is `done`**. If Codex ends `timeout` (or `error`) instead, no reviewer completed — do **not** finalize on an empty triage; stop and notify the user per the positive completion gate in step 3.
-- **Codex is NOT configured** → do nothing and do not wait for the limit to reset. Notify the user that Claude's usage limit is exhausted and stop the cycle. The user can re-run later (or add Codex via `--reconfigure`).
-
-The `wait-for-reviews.sh` source lives next to this skill; read it if you need to adjust detection markers or timing.
+There is no per-reviewer status, no state file, and nothing to resume — each new round just
+posts a fresh request (step 2) and runs the waiter again. If the background run is lost,
+re-run the same command; a fresh wait is harmless.
 
 **Anti-patterns — do NOT use:**
-- **Waiting on a comment count / "a new comment appeared"** (`… | select(.user.login==BOT) | length > N`). Claude edits its single comment in place, so the count never grows — this hangs forever (the PR #642 stall). Always check the **body**, which is exactly what `wait-for-reviews.sh` does.
-- **Re-inventing the wait loop inline each time.** There is one waiter; run it. Don't hand-roll a fresh `until gh api …` per invocation — that is how subtly-wrong conditions (like the count check above) creep back in.
-- `Bash("sleep 120 && gh ...")` — a *leading* `sleep` is blocked by the runtime. (`sleep` *inside* the waiter loop is fine.)
+- `Bash("sleep 120 && gh ...")` — a *leading* `sleep` is blocked by the runtime. The `sleep` inside the backgrounded waiter is fine.
 - `Bash("sleep 60 && sleep 60 && ...")` — chained short sleeps are blocked too.
 - `Monitor("until gh api ...; do sleep 30; done")` — `gh api` fails inside the sandbox because of TLS interception.
 - Any `gh ...` call without `dangerouslyDisableSandbox: true`.
-
-**Decision table:**
-
-| What we wait for | Tool |
-|---|---|
-| Any reviewer (Claude and/or Codex) to finish | **`wait-for-reviews.sh`** via `Bash + run_in_background + dangerouslyDisableSandbox` |
-| A specific GitHub Actions workflow run to finish | `gh run watch <RUN_ID> --exit-status` via `Bash + dangerouslyDisableSandbox` (optional; the waiter already covers review completion) |
-| Just "N seconds" with no condition | `ScheduleWakeup`, not a leading `sleep` |
 
 ### 4. Analyze and triage comments
 
@@ -203,9 +169,7 @@ gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.l
 gh pr view <PR> --json reviews --jq '.reviews'
 # PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and
 # Claude's inline notes) post actionable issues HERE, and `gh pr view --json reviews`
-# does NOT return them. The step-3 waiter already uses this surface as a completion
-# signal, so a reviewer can be `done` purely on an inline finding — triage MUST read it
-# too, or a real FIX is silently skipped before merge:
+# does NOT return them. Miss this surface and a real FIX is silently skipped before merge:
 gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq '[.[] | {id, user: .user.login, path, line, body, created_at}]'
 ```
 Process comments from **all three surfaces** and from every reviewer, not just `claude[bot]`. An inline review comment with an actionable finding is a first-class triage input, exactly like an issue comment.
@@ -226,10 +190,10 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 - `CONFLICTING` — quote the contradicting previous comment and ask the reviewer to clarify
 - `HALLUCINATION` — show concrete evidence from the codebase (grep results, file contents) that disproves the reviewer's claim
 
-**Decide whether to finalize:**
-- **No configured reviewer reached `done`** (the positive completion gate from step 3) → do NOT finalize. If every reviewer is some mix of `timeout` / `limit` / `error` and none is `done`, no review was actually read, so an empty triage is not approval. Notify the user and stop. This must be checked FIRST — before interpreting the absence of `FIX` verdicts.
-- **Any reviewer status is `error`** (from step 3) → do NOT finalize. A sustained API outage means the review was never actually read, so "no `FIX` verdicts" here is meaningless — it only reflects an empty fetch, not an approval. Notify the user and stop; never let an outage become a silent merge.
-- **No `FIX` verdicts** in the triage result, **and at least one reviewer was `done`** (and no `error`) → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real completed review, the absence of blocking issues IS the approval signal.
+**Decide whether to finalize** — check these in order:
+- **Step 3 returned `ERROR`** → do NOT finalize. The comments could not be read (a sustained API outage), so an empty triage is meaningless, not approval. Notify the user and stop; never let an outage become a silent merge.
+- **No reviewer was actually heard from this round** → do NOT finalize. If the configured bots posted nothing new for this round (the bots were slow, or Claude shows a usage-limit message instead of a review and no other reviewer responded), then no review happened — "no `FIX` verdicts" only reflects silence, not an approval. Treat a Claude usage-limit message as "Claude did not review" (not a finding). If Codex is configured and reviewed, you may proceed on Codex alone; if nobody reviewed, notify the user and stop. This must be checked BEFORE interpreting the absence of `FIX` verdicts.
+- **No `FIX` verdicts**, and at least one reviewer actually reviewed → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal.
 - **At least one `FIX`** → proceed to step 5.
 
 ### 5. Fix issues
@@ -242,7 +206,7 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 ### 6. Commit and push
 - Commit fixes with a meaningful message (conventional commits style)
 - Push to remote
-- Return to step 2. This begins a **new review round**, so the first step-3 waiter call of this round must pass `RESET=1` (a new request deserves a fresh wait; otherwise the prior round's `done` short-circuits it).
+- Return to step 2. This begins a **new review round**: post a fresh review request, then run the step-3 waiter again (it always waits a clean fixed window — nothing to reset).
 
 ### 7. Check CI before merge
 
@@ -285,4 +249,4 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - Every commit must have a meaningful message following conventional commits style
 - Run lint and tests before every commit
 - If tests fail after fixes — fix them before pushing
-- Never merge without a completed review. Apply the positive completion gate from step 3: finalize only if **at least one configured reviewer ended `done`**. If none did — every reviewer is some mix of `timeout` / `limit` (e.g. all-`timeout`, or `claude=limit` + `codex=timeout`) — notify the user and stop: the reviewer bot may be misconfigured, rate-limited, or unavailable. If any reviewer is `error`, stop per step 3 (a sustained API outage — never merge on an unread review).
+- Never merge without a real review. Finalize only if at least one configured reviewer actually posted a review this round (see the finalize gate in step 4). If the bots stayed silent, or Claude only showed a usage-limit message and no one else reviewed, or step 3 returned `ERROR` (a sustained API outage) — notify the user and stop. An empty triage from silence or an outage is not an approval.
