@@ -79,16 +79,24 @@ mkdir -p "$STATE_DIR"
 
 [ "$RESET" = 1 ] && rm -f "$STATE_FILE"
 
-# State schema: { "start": <epoch>, "statuses": { "claude": "done", ... } }
-# Read the original start epoch if resuming; otherwise stamp a fresh one and persist.
+# State schema: { "start": <epoch>, "start_iso": <ISO-8601>, "statuses": { "claude": "done", ... } }
+# `start_iso` is the round boundary: only bot comments/reviews updated AFTER it count
+# as this round's verdict, so an old in-place-edited "Claude finished" (Claude reuses
+# one comment forever) or a stale prior-round Codex review can't short-circuit a fresh
+# round. Read the original boundary when resuming; otherwise stamp a fresh one.
 if [ -f "$STATE_FILE" ] && jq -e '.start' "$STATE_FILE" >/dev/null 2>&1; then
   START="$(jq -r '.start' "$STATE_FILE")"
+  START_ISO="$(jq -r '.start_iso // ""' "$STATE_FILE")"
   RESUMED=1
 else
   START="$(date +%s)"
+  START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   RESUMED=0
-  printf '{"start":%s,"statuses":{}}' "$START" > "$STATE_FILE"
+  printf '{"start":%s,"start_iso":"%s","statuses":{}}' "$START" "$START_ISO" > "$STATE_FILE"
 fi
+# Back-compat: a state file written before start_iso existed has none — fall back to
+# the epoch START so the round-scoping filter still has a valid boundary.
+[ -z "$START_ISO" ] && START_ISO="$(date -u -r "$START" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '1970-01-01T00:00:00Z')"
 
 # Read a reviewer's persisted status ("" if none).
 status_of() { jq -r --arg r "$1" '.statuses[$r] // ""' "$STATE_FILE"; }
@@ -105,10 +113,14 @@ settle() {  # settle <reviewer> <status> [suffix]
 }
 is_settled() { [ -n "$(status_of "$1")" ]; }
 
-# latest body from a given bot login, "" if none
+# latest body from a given bot login, "" if none.
+#   latest_body <comments-json> <login> <since-iso>
+# Only considers comments/reviews whose updated_at (or created_at) is strictly after
+# <since-iso> — this scopes completion detection to the current review round.
 latest_body() {
-  printf '%s' "$1" | jq -r --arg u "$2" \
-    '[.[] | select(.user.login==$u)] | (last // {}) | .body // ""'
+  printf '%s' "$1" | jq -r --arg u "$2" --arg since "$3" \
+    '[.[] | select(.user.login==$u) | select(((.updated_at // .created_at) // "") > $since)]
+     | (last // {}) | .body // ""'
 }
 
 # Announce reviewers already settled in a prior run (resume path).
@@ -125,12 +137,26 @@ while :; do
   for r in $REVIEWERS; do is_settled "$r" || alldone=0; done
   [ "$alldone" -eq 1 ] && break
 
-  COMMENTS="$(gh api "repos/$OWNER/$REPO/issues/$PR/comments" --paginate 2>/dev/null || echo '[]')"
+  # A reviewer can speak on any of three GitHub surfaces, and bots differ on which:
+  #   - issue comments      (Claude edits its single one in place)
+  #   - PR review objects    (Codex posts its verdict here — invisible to issue comments)
+  #   - PR inline review comments
+  # We merge all three into one flat array. `--paginate` WITHOUT `--slurp` emits each
+  # page as a separate JSON array, which breaks `[.[]]|last` (it runs per page); so we
+  # always `--slurp` then `add` to flatten. Reviews use `.submitted_at`, normalized to
+  # `.updated_at` so latest_body's round-scoping filter works uniformly.
+  ISSUE_C="$(gh api "repos/$OWNER/$REPO/issues/$PR/comments" --paginate --slurp 2>/dev/null \
+    | jq -c 'add // []' 2>/dev/null || echo '[]')"
+  REVIEWS="$(gh api "repos/$OWNER/$REPO/pulls/$PR/reviews" --paginate --slurp 2>/dev/null \
+    | jq -c '(add // []) | [.[] | {user, body, updated_at: .submitted_at, created_at: .submitted_at}]' 2>/dev/null || echo '[]')"
+  INLINE_C="$(gh api "repos/$OWNER/$REPO/pulls/$PR/comments" --paginate --slurp 2>/dev/null \
+    | jq -c 'add // []' 2>/dev/null || echo '[]')"
+  COMMENTS="$(printf '%s\n%s\n%s' "$ISSUE_C" "$REVIEWS" "$INLINE_C" | jq -cs 'add // []' 2>/dev/null || echo '[]')"
   NOW="$(date +%s)"; ELAPSED=$(( NOW - START ))
 
   for r in $REVIEWERS; do
     is_settled "$r" && continue
-    body="$(latest_body "$COMMENTS" "$(login_of "$r")")"
+    body="$(latest_body "$COMMENTS" "$(login_of "$r")" "$START_ISO")"
 
     if [ "$r" = claude ]; then
       if printf '%s' "$body" | grep -qiE "$LIMIT_RE"; then settle claude limit; continue; fi
