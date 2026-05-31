@@ -70,6 +70,21 @@ maxwait_of() {
   esac
 }
 
+# Server-side round boundary: the ISO timestamp of the most recent review-REQUEST
+# issue comment (body mentions a reviewer + "review"). A bot's reply to THIS request
+# necessarily comes AFTER the request, and the request itself comes AFTER any prior
+# round's bot activity — so using it as the round boundary both admits this round's
+# response and still excludes a stale prior-round one (keeps the Claim-A fix intact).
+# Using a GitHub timestamp, not the local clock, makes it immune to clock skew and to
+# the gap between step-2 posting the request and step-3 starting this waiter. Prints
+# "" if none is visible (caller then falls back to a margin-adjusted local clock).
+request_boundary_iso() {
+  gh api "repos/$OWNER/$REPO/issues/$PR/comments" --paginate --slurp 2>/dev/null \
+    | jq -r '(add // [])
+        | map(select((.body // "") | test("@(claude|codex)"; "i") and test("review"; "i")))
+        | sort_by(.created_at) | (last // {}) | .created_at // ""' 2>/dev/null || printf ''
+}
+
 # Claude signals completion by editing "Claude finished" into its comment body.
 CLAUDE_DONE='Claude finished'
 # Claude usage-cap messages (case-insensitive). Confirmed wording includes
@@ -98,7 +113,16 @@ if [ -f "$STATE_FILE" ] && jq -e '.start' "$STATE_FILE" >/dev/null 2>&1; then
   RESUMED=1
 else
   START="$(date +%s)"
-  START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Prefer the server timestamp of THIS round's review-request comment: it predates any
+  # bot reply to that request and is clock-skew-proof, so a fast bot or a delay between
+  # posting the request (step 2) and starting this waiter (step 3) can't push the
+  # boundary past a real response and falsely time it out. Fall back to local clock
+  # minus a safety margin when no request comment is visible.
+  START_ISO="$(request_boundary_iso)"
+  if [ -z "$START_ISO" ]; then
+    START_ISO="$(date -u -r "$(( START - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+      || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
   RESUMED=0
   printf '{"start":%s,"start_iso":"%s","statuses":{}}' "$START" "$START_ISO" > "$STATE_FILE"
 fi
