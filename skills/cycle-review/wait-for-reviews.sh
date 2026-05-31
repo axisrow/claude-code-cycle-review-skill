@@ -178,11 +178,15 @@ is_settled() { [ -n "$(status_of "$1")" ]; }
 # latest body from a given bot login, "" if none.
 #   latest_body <comments-json> <login> <since-iso>
 # Only considers comments/reviews whose updated_at (or created_at) is strictly after
-# <since-iso> — this scopes completion detection to the current review round.
+# <since-iso> — this scopes completion detection to the current review round. The input
+# concatenates three surfaces (issue / review / inline) in fetch order, so `last` by
+# array position is NOT newest-by-time: sort by timestamp first, or e.g. a freshly
+# edited issue comment with "Claude finished" would lose to an older inline finding
+# appended later and the finish marker would never be seen (timeout despite a done review).
 latest_body() {
   printf '%s' "$1" | jq -r --arg u "$2" --arg since "$3" \
     '[.[] | select(.user.login==$u) | select(((.updated_at // .created_at) // "") > $since)]
-     | (last // {}) | .body // ""'
+     | sort_by((.updated_at // .created_at) // "") | (last // {}) | .body // ""'
 }
 
 # Fetch a paginated+slurped endpoint, distinguishing FAILURE from empty-but-ok.
