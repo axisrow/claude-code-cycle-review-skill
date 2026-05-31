@@ -111,6 +111,24 @@ mkdir -p "$STATE_DIR"
 
 [ "$RESET" = 1 ] && rm -f "$STATE_FILE"
 
+# The server timestamp of THIS run's latest review-request comment. Computed once and
+# reused as both the auto-invalidation key and the fresh-round boundary.
+REQ_ISO="$(request_boundary_iso)"
+
+# Auto-invalidate stale state: if a saved wait exists but a NEWER review request has
+# been posted since it was stamped (its start_iso predates the current request), the
+# old statuses belong to a previous request — resuming them would let a `done`/`timeout`
+# from a prior run skip the freshly-requested review (and possibly merge unreviewed).
+# Treat that exactly like RESET=1. A plain resume within the same round has REQ_ISO
+# equal to the stored start_iso (same request) and is preserved.
+if [ -f "$STATE_FILE" ] && jq -e '.start_iso' "$STATE_FILE" >/dev/null 2>&1 && [ -n "$REQ_ISO" ]; then
+  PREV_ISO="$(jq -r '.start_iso // ""' "$STATE_FILE")"
+  if [ -n "$PREV_ISO" ] && [ "$REQ_ISO" \> "$PREV_ISO" ]; then
+    rm -f "$STATE_FILE"
+    echo "EVENT all reset (new review request since last wait)"
+  fi
+fi
+
 # State schema: { "start": <epoch>, "start_iso": <ISO-8601>, "statuses": { "claude": "done", ... } }
 # `start_iso` is the round boundary: only bot comments/reviews updated AFTER it count
 # as this round's verdict, so an old in-place-edited "Claude finished" (Claude reuses
@@ -122,12 +140,12 @@ if [ -f "$STATE_FILE" ] && jq -e '.start' "$STATE_FILE" >/dev/null 2>&1; then
   RESUMED=1
 else
   START="$(date +%s)"
-  # Prefer the server timestamp of THIS round's review-request comment: it predates any
-  # bot reply to that request and is clock-skew-proof, so a fast bot or a delay between
-  # posting the request (step 2) and starting this waiter (step 3) can't push the
-  # boundary past a real response and falsely time it out. Fall back to local clock
-  # minus a safety margin when no request comment is visible.
-  START_ISO="$(request_boundary_iso)"
+  # Prefer the server timestamp of THIS round's review-request comment (REQ_ISO): it
+  # predates any bot reply to that request and is clock-skew-proof, so a fast bot or a
+  # delay between posting the request (step 2) and starting this waiter (step 3) can't
+  # push the boundary past a real response and falsely time it out. Fall back to local
+  # clock minus a safety margin when no request comment is visible.
+  START_ISO="$REQ_ISO"
   if [ -z "$START_ISO" ]; then
     START_ISO="$(epoch_to_iso "$(( START - 120 ))")"
     [ -z "$START_ISO" ] && START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

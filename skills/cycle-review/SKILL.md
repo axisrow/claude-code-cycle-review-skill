@@ -148,6 +148,8 @@ RESET=1 OWNER=<owner> REPO=<repo> PR=<PR> REVIEWERS="<configured>" \
 ```
 Within the same round (a plain resume after an interruption), do NOT pass `RESET` — that would throw away the progress you want to keep.
 
+**Safety net — the waiter auto-invalidates stale state.** Even if you forget `RESET=1`, the waiter compares the saved `start_iso` against the server timestamp of the latest review-request comment. If a newer request was posted since the saved wait (a new round, or a brand-new invocation that re-requested review in step 2), the old `done`/`timeout` statuses belong to a *previous* request, so the waiter discards them and starts fresh (you'll see `EVENT all reset (new review request since last wait)`). This prevents a prior run's completed/aborted status from making the waiter emit `(resumed)` and skip the freshly-requested review — which could otherwise let the cycle proceed to merge without ever reading a review for the current request. A genuine resume within the same round (same request → same timestamp) is unaffected and still resumes.
+
 **Reading its output.** The script streams `EVENT <reviewer> <done|limit|timeout|error>` lines (a `(resumed)` suffix means that status carried over from a prior run) and ends with a `FINAL` block, then a `STATE <path>` line pointing at the persisted state file:
 ```
 FINAL
@@ -192,10 +194,18 @@ The `wait-for-reviews.sh` source lives next to this skill; read it if you need t
 
 Read all comments and review comments from **all reviewers** (bot and human). Fetch both issue comments and PR review comments:
 ```bash
+# Issue comments (Claude edits its single one here):
 gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.login, body, created_at}]'
+# PR review objects — body/state/author (Codex posts its review summary here):
 gh pr view <PR> --json reviews --jq '.reviews'
+# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and
+# Claude's inline notes) post actionable issues HERE, and `gh pr view --json reviews`
+# does NOT return them. The step-3 waiter already uses this surface as a completion
+# signal, so a reviewer can be `done` purely on an inline finding — triage MUST read it
+# too, or a real FIX is silently skipped before merge:
+gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq '[.[] | {id, user: .user.login, path, line, body, created_at}]'
 ```
-Process comments from every reviewer, not just `claude[bot]`.
+Process comments from **all three surfaces** and from every reviewer, not just `claude[bot]`. An inline review comment with an actionable finding is a first-class triage input, exactly like an issue comment.
 
 Launch a subagent (Agent tool) to triage each comment. The subagent must:
 - Read the current code of files referenced in the comments
