@@ -70,6 +70,15 @@ maxwait_of() {
   esac
 }
 
+# Portable epoch → UTC ISO-8601. BSD/macOS uses `date -r <epoch>`; GNU/Linux uses
+# `date -d @<epoch>` (there `-r` means --reference=FILE and would fail on an epoch).
+# Try BSD first, fall back to GNU; empty string if both fail.
+epoch_to_iso() {
+  date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || printf ''
+}
+
 # Server-side round boundary: the ISO timestamp of the most recent review-REQUEST
 # issue comment (body mentions a reviewer + "review"). A bot's reply to THIS request
 # necessarily comes AFTER the request, and the request itself comes AFTER any prior
@@ -120,15 +129,18 @@ else
   # minus a safety margin when no request comment is visible.
   START_ISO="$(request_boundary_iso)"
   if [ -z "$START_ISO" ]; then
-    START_ISO="$(date -u -r "$(( START - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-      || date -u +%Y-%m-%dT%H:%M:%SZ)"
+    START_ISO="$(epoch_to_iso "$(( START - 120 ))")"
+    [ -z "$START_ISO" ] && START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
   RESUMED=0
   printf '{"start":%s,"start_iso":"%s","statuses":{}}' "$START" "$START_ISO" > "$STATE_FILE"
 fi
 # Back-compat: a state file written before start_iso existed has none — fall back to
 # the epoch START so the round-scoping filter still has a valid boundary.
-[ -z "$START_ISO" ] && START_ISO="$(date -u -r "$START" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '1970-01-01T00:00:00Z')"
+if [ -z "$START_ISO" ]; then
+  START_ISO="$(epoch_to_iso "$START")"
+  [ -z "$START_ISO" ] && START_ISO='1970-01-01T00:00:00Z'
+fi
 
 # Read a reviewer's persisted status ("" if none).
 status_of() { jq -r --arg r "$1" '.statuses[$r] // ""' "$STATE_FILE"; }
