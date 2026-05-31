@@ -163,13 +163,16 @@ Possible per-reviewer statuses:
 - `limit` (Claude only) → Claude hit its usage cap (its body matched `usage limit` / `Max usage limit` / `rate limit` / `quota`). Handle per step 3.1 below.
 - `error` → a **sustained GitHub API outage** (auth expired, rate-limited, network/TLS failure) prevented the reviews from being read at all — the waiter could not fetch comments for `FETCH_FAIL_MAX` consecutive ticks. This is **not** "no findings". Do **NOT** triage-as-empty and do **NOT** proceed to merge: tell the user the review could not be obtained (and why, e.g. check `gh auth status`) and **stop the cycle**. `error` is fail-closed; `timeout` is fail-soft. Never collapse the two.
 
-When all configured reviewers reach a terminal status the waiter exits. If any reviewer is `error`, stop per the rule above. Otherwise proceed to step 4 using only the comments of reviewers whose status is `done` (or the partial body of a `timeout`ed one).
+When all configured reviewers reach a terminal status the waiter exits. Then apply this **positive completion gate** before doing anything else:
+- If any reviewer is `error` → stop (sustained outage; see above).
+- **At least one configured reviewer must be `done`** to proceed. `done` is the only status that means a review was actually read. If NO reviewer is `done` — i.e. every configured reviewer is some combination of `timeout` / `limit` (e.g. `claude=limit` + `codex=timeout`, where neither the all-`timeout` guard nor the `error` guard fires) — then no review ever completed, triage would be empty, and proceeding would merge unreviewed. **Stop and notify the user** instead. Do not treat "no `error` and no `FIX`" as approval when the real reason is that nobody finished.
+- Otherwise (≥1 `done`) → proceed to step 4 using the comments of every `done` reviewer (plus the partial body of any `timeout`ed one, as best-effort context only).
 
 Optionally, if a single Claude Action workflow run is what you're tracking, `gh run watch <RUN_ID> --exit-status` (via `Bash + dangerouslyDisableSandbox`) is a native blocking watch — but the waiter above already covers review completion and is the default path.
 
 #### 3.1. Claude usage-limit handling
 When the waiter reports `claude=limit`, branch on whether `@codex` is in the configured reviewers list:
-- **Codex is configured** → do NOT wait for Claude's limit to reset. Notify the user that Claude hit its usage limit and that this run continues on Codex only, then drop Claude from triage and proceed once Codex's status is `done` (the waiter is already only waiting on Codex at that point).
+- **Codex is configured** → do NOT wait for Claude's limit to reset. Notify the user that Claude hit its usage limit and that this run continues on Codex only, then drop Claude from triage and proceed **only once Codex's status is `done`**. If Codex ends `timeout` (or `error`) instead, no reviewer completed — do **not** finalize on an empty triage; stop and notify the user per the positive completion gate in step 3.
 - **Codex is NOT configured** → do nothing and do not wait for the limit to reset. Notify the user that Claude's usage limit is exhausted and stop the cycle. The user can re-run later (or add Codex via `--reconfigure`).
 
 The `wait-for-reviews.sh` source lives next to this skill; read it if you need to adjust detection markers or timing.
@@ -224,8 +227,9 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 - `HALLUCINATION` — show concrete evidence from the codebase (grep results, file contents) that disproves the reviewer's claim
 
 **Decide whether to finalize:**
+- **No configured reviewer reached `done`** (the positive completion gate from step 3) → do NOT finalize. If every reviewer is some mix of `timeout` / `limit` / `error` and none is `done`, no review was actually read, so an empty triage is not approval. Notify the user and stop. This must be checked FIRST — before interpreting the absence of `FIX` verdicts.
 - **Any reviewer status is `error`** (from step 3) → do NOT finalize. A sustained API outage means the review was never actually read, so "no `FIX` verdicts" here is meaningless — it only reflects an empty fetch, not an approval. Notify the user and stop; never let an outage become a silent merge.
-- **No `FIX` verdicts** in the triage result (and no `error`) → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; the absence of blocking issues IS the approval signal.
+- **No `FIX` verdicts** in the triage result, **and at least one reviewer was `done`** (and no `error`) → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real completed review, the absence of blocking issues IS the approval signal.
 - **At least one `FIX`** → proceed to step 5.
 
 ### 5. Fix issues
@@ -281,4 +285,4 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - Every commit must have a meaningful message following conventional commits style
 - Run lint and tests before every commit
 - If tests fail after fixes — fix them before pushing
-- If the `wait-for-reviews.sh` driver returns `timeout` for every configured reviewer (no review body ever appeared within the max wait) — notify the user and stop: the reviewer bot may be misconfigured or unavailable. If it returns `error` for any reviewer, stop per step 3 (a sustained API outage — never merge on an unread review).
+- Never merge without a completed review. Apply the positive completion gate from step 3: finalize only if **at least one configured reviewer ended `done`**. If none did — every reviewer is some mix of `timeout` / `limit` (e.g. all-`timeout`, or `claude=limit` + `codex=timeout`) — notify the user and stop: the reviewer bot may be misconfigured, rate-limited, or unavailable. If any reviewer is `error`, stop per step 3 (a sustained API outage — never merge on an unread review).
