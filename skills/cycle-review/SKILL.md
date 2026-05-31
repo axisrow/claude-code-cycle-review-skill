@@ -2,7 +2,7 @@
 name: cycle-review
 description: Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Aliased as /cr.
 disable-model-invocation: true
-allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent
+allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
 argument-hint: "[pr-numbers...] [--reconfigure]"
 ---
 
@@ -271,4 +271,4 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - Every commit must have a meaningful message following conventional commits style
 - Run lint and tests before every commit
 - If tests fail after fixes — fix them before pushing
-- If `gh run watch` finds no run id and the fallback comment polling makes no progress after 3 attempts — notify the user and stop: the reviewer bot may be misconfigured or unavailable
+- If the `wait-for-reviews.sh` driver returns `timeout` for every configured reviewer (no review body ever appeared within the max wait) — notify the user and stop: the reviewer bot may be misconfigured or unavailable. If it returns `error` for any reviewer, stop per step 3 (a sustained API outage — never merge on an unread review).
