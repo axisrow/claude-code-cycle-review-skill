@@ -16,7 +16,7 @@ If `$ARGUMENTS` contains the standalone command token `onboard`, or the legacy f
 
 ## Cycle
 
-Run step 0 (onboarding) once at the start of every invocation, then repeat steps 2–6 until the PR has no `FIX` verdicts, then run step 7 (CI) and step 8 (merge).
+Run step 0 (onboarding) once at the start of every invocation. Then, for each PR, run step 1.5 (verify the PR implements its linked issue 100% — fix any gap BEFORE asking the bots), repeat steps 2–6 until the PR has no `FIX` verdicts — **but no more than 3 cycles**; if a 3rd cycle still has `FIX`s, stop and hand back to the user to narrow scope. Once a round is clean, run step 6.5 (final cleanup pass — apply the minor findings deferred across all earlier rounds), step 7 (CI) and step 8 (merge).
 
 ### 0. Onboarding — which reviewers are available (run once per invocation)
 
@@ -109,6 +109,35 @@ Skip this step only when there is exactly one PR to handle (single-PR run, no ot
 
 5. After each successful merge in step 8, return here: pop the merged PR from the queue, recompute file overlap for the rest (the codebase has changed), and continue with the next PR.
 
+### 1.5. Verify the PR implements its linked issue 100% (before any review)
+
+Run this **once per PR, before step 2** — do NOT ask the bots to review a half-finished PR. Review bots check whether the *code* is correct, not whether it is *complete* relative to the issue's design; a PR can be approved by both bots and still ship only half of what the issue asked for. Catch that here, up front, not after a wasted review round (or after merging an incomplete issue).
+
+1. **Find the linked issue.** A repo convention may require a closing keyword (`Closes #N`) in every PR. Read the PR body and the structured closing references:
+   ```bash
+   gh pr view <PR> --json body,closingIssuesReferences \
+     --jq '{body, issues: [.closingIssuesReferences[].number]}'
+   ```
+   If there is no linked issue (e.g. a pure refactor/chore with none) — skip this step and go to step 2.
+
+2. **Read the issue's design in full:**
+   ```bash
+   gh issue view <N> --json title,body --jq '{title, body}'
+   ```
+   Extract every concrete deliverable the design specifies — each output format, flag, marker, edge case, file the issue names. Treat the design section as a checklist, not a vibe.
+
+3. **Confirm each deliverable is actually implemented.** Read the changed code and `grep` the repo to verify every item on that checklist is present in this PR's diff (not merely planned, not "mostly"). A design that lists two markers/flags/outputs and a PR that ships one is a **gap**, even if the shipped half is flawless.
+
+4. **If a gap exists — close it now (before review):**
+   - Implement the missing pieces test-first (write the failing test, then the code), following the repo's conventions.
+   - Run the repo's linter and full test suite green.
+   - Commit (conventional-commits style) and push to the PR branch.
+   - Only then proceed to step 2. The bots now review a complete PR in one pass.
+
+   If the gap is large or the issue's design is ambiguous, surface it to the user (with the specific missing deliverables) and ask how to proceed rather than guessing.
+
+5. If the PR fully implements the issue — proceed to step 2.
+
 ### 2. Request review
 
 Ping **all configured reviewers in a single comment** — concatenate every configured mention, space-separated, at the start of the body. The mention string depends on the active reviewers list from step 0:
@@ -193,8 +222,11 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 **Decide whether to finalize** — check these in order:
 - **Step 3 returned `ERROR`** → do NOT finalize. The comments could not be read (a sustained API outage), so an empty triage is meaningless, not approval. Notify the user and stop; never let an outage become a silent merge.
 - **No reviewer was actually heard from this round** → do NOT finalize. If the configured bots posted nothing new for this round (the bots were slow, or Claude shows a usage-limit message instead of a review and no other reviewer responded), then no review happened — "no `FIX` verdicts" only reflects silence, not an approval. Treat a Claude usage-limit message as "Claude did not review" (not a finding). If Codex is configured and reviewed, you may proceed on Codex alone; if nobody reviewed, notify the user and stop. This must be checked BEFORE interpreting the absence of `FIX` verdicts.
-- **No `FIX` verdicts**, and at least one reviewer actually reviewed → post the replies above for any non-`FIX` comments and proceed to step 7. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal.
-- **At least one `FIX`** → proceed to step 5.
+- **No `FIX` verdicts**, and at least one reviewer actually reviewed → this is the **final cycle**. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal. Post the replies above for any non-`FIX` comments, then go to **step 6.5** (final cleanup pass — apply the accumulated minor findings) before CI + merge. Do NOT skip straight to step 7.
+- **At least one `FIX`, and this is the 3rd cycle** → STOP, do not start a 4th. Three full review rounds with findings still outstanding means the PR isn't converging on its own — looping further wastes review budget. Notify the user: summarize the still-open `FIX` findings and propose narrowing scope — e.g. move some findings **out of scope** into a follow-up issue/PR so the core change can merge, or have the user rethink the approach. Wait for the user's decision; do not merge and do not auto-loop. (Count a "cycle" as one completed round of steps 2–6, i.e. one review request + triage. The round that produced this 3rd batch of `FIX`s is the 3rd.)
+- **At least one `FIX`, and this is cycle 1 or 2** → proceed to step 5.
+
+The cycle counter lives only in your working memory across a long conversation, so make it observable: at the end of every triage, **explicitly state the current cycle number** to the user (e.g. "Triage of cycle 2/3 complete: 1 FIX, 2 SKIP"). This keeps the 3-cycle cap self-checkable instead of relying on hidden state.
 
 ### 5. Fix issues
 - Only fix comments with the `FIX` verdict from step 4
@@ -206,7 +238,27 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 ### 6. Commit and push
 - Commit fixes with a meaningful message (conventional commits style)
 - Push to remote
-- Return to step 2. This begins a **new review round**: post a fresh review request, then run the step-3 waiter again (it always waits a clean fixed window — nothing to reset).
+- Return to step 2 ONLY if fewer than 3 cycles have run. This begins a **new review round**: post a fresh review request, then run the step-3 waiter again (it always waits a clean fixed window — nothing to reset). Keep a running count of completed cycles (one cycle = one steps 2–6 round). **Hard cap: 3 cycles.** If the round you just triaged was the 3rd and it still had `FIX` verdicts, do NOT loop again — stop and hand back to the user per the step-4 "3rd cycle" gate (summarize the open findings, propose moving some out of scope into a follow-up issue/PR, or rethinking the approach). The cap only bites when findings persist; a clean 1st or 2nd round finalizes normally.
+
+### 6.5. Final cleanup pass (last cycle — apply the accumulated minor findings)
+
+Reached only on the **final cycle** — when a round has no `FIX` verdicts (step 4) and at least one reviewer actually reviewed. This is the last cycle: there will be **no further review round** after it. Before merging, spend this one pass cleaning up everything that was correct-but-not-blocking and was therefore deferred across the earlier rounds, so nothing useful is left on the table.
+
+1. **Gather the minor findings from EVERY previous review round, not just the last one.** Re-read all comments from all three surfaces (issue comments, PR reviews, inline review comments — same fetch as step 4) across the whole PR history. Collect every finding that is real and actionable but was not a `FIX`:
+   - all `SKIP` (genuine cosmetic/style/naming/minor-improvement findings), and
+   - any reasonable nice-to-have the reviewers suggested (e.g. "add a clarifying comment", "rename for clarity", "tidy this helper", "add a migration note") — even when previously deferred as non-blocking.
+
+   Explicitly EXCLUDE the verdicts that have nothing to fix: `HALLUCINATION` (claim is false), `IRRELEVANT` (not this PR's code), `CONFLICTING` (contradictory — ask, don't guess), and `ALREADY_FIXED` (already done). De-dup findings that recurred across rounds by their substance (use `path` + `line` when present, as on Codex inline comments; otherwise the gist of the body — Claude's single issue comment has no path/line), and skip any that a later commit already addressed.
+
+2. **Apply all of them.** Make the edits, keeping each change minimal and faithful to the reviewer's intent. If a suggested change would be risky, change behavior, or contradicts the repo's conventions, do NOT force it — leave a short reply explaining why it was left out (this is the only thing that may remain unfixed).
+
+3. **Lint and test green**, same as step 5 (`ruff check src/ tests/`, `pytest tests/ -v` — or the repo's equivalents).
+
+4. **Commit and push** (conventional-commits style, e.g. `chore: apply non-blocking review nitpicks before merge`). On the PR, briefly note that the deferred minor findings were applied in `<sha>`.
+
+5. **Do NOT return to step 2.** This pass does not request another review — proceed directly to step 7 (CI) and step 8 (merge). The cleanup commit rides the same CI run.
+
+If, after re-reading every round, there are genuinely no minor findings to apply (a clean PR that never accrued any `SKIP`/nice-to-have), this step is a no-op — proceed to step 7.
 
 ### 7. Check CI before merge
 
@@ -240,12 +292,14 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - return to step 2 with the next PR.
 
 ## Important
-- Reviewers are configured once via onboarding (step 0) and stored globally at `~/.claude/cycle-review/config.json`. Re-run onboarding with `/cr onboard` (legacy: `--onboard` or `--reconfigure`). Never hardcode `@claude` — always drive steps 2–3 from the configured reviewers list.
+- **Verify completeness before review (step 1.5).** For every PR with a linked issue, confirm the PR implements the issue's design 100% BEFORE requesting a review. Bots check code correctness, not completeness against the issue — they will happily approve a PR that ships only half the design. Read the issue, turn its design into a checklist, verify each item in the diff, and close any gap (test-first) before step 2. Never start the review loop on a half-finished issue.
+- **Final cleanup pass before merge (step 6.5).** The round with no `FIX` verdicts is the LAST cycle — there is no review round after it. On that pass, apply ALL the accumulated minor findings (every genuine `SKIP` plus any reasonable nice-to-have suggestion) gathered from **every previous review round**, not just the last one — they were deferred with a reply during the loop, but the final pass actually fixes them. Exclude only `HALLUCINATION` / `IRRELEVANT` / `CONFLICTING` / `ALREADY_FIXED` (nothing to fix there). Lint + test + commit the cleanup, then go straight to CI + merge — do NOT request another review for it.
+- **Max 3 review cycles per PR.** One cycle = one steps 2–6 round (review request + triage + fix). If a 3rd cycle still surfaces `FIX` verdicts, STOP — do not start a 4th. Three rounds with blocking findings still open means the PR isn't converging; looping further wastes review budget. Hand back to the user: summarize the still-open findings and propose narrowing scope (move some out of scope into a follow-up issue/PR so the core change can merge, or rethink the approach). Don't merge and don't auto-loop past the cap. The cap only triggers when findings persist — a clean 1st or 2nd round finalizes normally.
 - When both reviewers are configured, ping them in **one** comment whose body starts with `@claude @codex`. With a single reviewer, use just that mention.
 - Codex is slower than Claude (~5 min vs ~2 min): use the per-reviewer initial wait / max wait from the step 0 table, never Claude's window for Codex.
 - If Claude hits its usage limit (step 3.4): when Codex is configured, drop Claude for this run and continue on Codex; when Codex is not configured, just notify the user the limit is exhausted and stop — do **not** wait for the limit to reset.
 - All `gh` commands (and any other GitHub API calls) must be run via Bash with `dangerouslyDisableSandbox: true`, as the sandbox blocks TLS connections to api.github.com
-- Do not skip critical comments — fix all with the `FIX` verdict. Cosmetic comments (`SKIP`) can be skipped with a reply
+- Do not skip critical comments — fix all with the `FIX` verdict. During the review loop, `SKIP` (cosmetic) comments are answered with a reply; on the FINAL pass (step 6.5) they are actually applied, not skipped.
 - Every commit must have a meaningful message following conventional commits style
 - Run lint and tests before every commit
 - If tests fail after fixes — fix them before pushing

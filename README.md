@@ -2,7 +2,7 @@
 
 > [Русская версия](README.ru.md)
 
-Automated PR review cycle for Claude Code. On first run it asks which review bots you have (`@claude`, `@codex`, or both). Plans a merge strategy when several PRs are open, requests a code review from every configured reviewer, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval — then squash-merges.
+Automated PR review cycle for Claude Code. On first run it asks which review bots you have (`@claude`, `@codex`, or both). Plans a merge strategy when several PRs are open, verifies each PR implements its linked issue 100% before review, requests a code review from every configured reviewer, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval — then squash-merges.
 
 ## Installation
 
@@ -76,6 +76,12 @@ When no config exists (or `onboard` is passed), asks which bots are available (`
 
 When several of your PRs are open, the skill maps file overlaps and PR stacks, then announces the merge order autonomously (earliest first when overlapping; any order when independent). You can interrupt and override.
 
+### 1.5. Verify the issue is implemented 100% (before review)
+
+Before pinging the bots, the skill checks that each PR actually implements its linked issue's full design — not just that the code compiles. It reads the linked issue (`Closes #N`), turns the design into a checklist, and verifies every deliverable (each output format, flag, marker, edge case) is present in the diff. Any gap is closed test-first and pushed **before** the review starts.
+
+Why up front: review bots judge whether the *code* is correct, not whether it's *complete* against the issue — both bots can approve a PR that ships only half the design. Catching that here avoids burning a review round (or merging an incomplete issue). If the gap is large or the design is ambiguous, the skill surfaces the missing deliverables and asks how to proceed.
+
 ### 2. Request review
 
 Pings **all configured reviewers in a single comment** — the body starts with every configured mention (`@claude @codex` when both are on, or just one), asking them to focus on critical issues only (bugs, security, logic errors, data loss, performance). Cosmetic nitpicks are explicitly discouraged.
@@ -105,7 +111,9 @@ Collects comments from **all reviewers** (bot and human) — both issue comments
 | `CONFLICTING` | Quote the contradicting comment, ask for clarification |
 | `HALLUCINATION` | Reply with evidence from the codebase disproving the claim |
 
-Finalization happens when no `FIX` verdicts remain — the skill does not require an explicit `APPROVED` review state, since bot reviewers rarely emit it.
+When no `FIX` verdicts remain, this is the **final cycle** — the skill does not require an explicit `APPROVED` review state, since bot reviewers rarely emit it. It posts replies for the non-`FIX` comments and moves on to the final cleanup pass (step 6.5) before merging.
+
+**Hard cap of 3 cycles.** A cycle is one review-request → triage → fix round. If a 3rd cycle still surfaces `FIX` verdicts, the skill stops instead of looping a 4th time — three rounds with findings still open means the PR isn't converging. It hands back to you with a summary of the still-open findings and a suggestion to narrow scope: move some out of scope into a follow-up issue/PR so the core change can merge, or rethink the approach. The cap only triggers when findings persist; a clean 1st or 2nd round finalizes normally.
 
 ### 5. Fix issues
 
@@ -115,9 +123,13 @@ Applies fixes for `FIX` verdicts only. Runs linter and tests before proceeding.
 
 Conventional commit message, push to remote, return to step 2.
 
+### 6.5. Final cleanup pass (last cycle)
+
+Reached only on the final cycle — when a round has no `FIX` verdicts. Since there's no review round after this one, the skill spends one pass applying **all the minor findings deferred across every previous round** (not just the last): every genuine `SKIP` cosmetic/style/naming nitpick plus any reasonable nice-to-have suggestion the reviewers made. It excludes the verdicts with nothing to fix (`HALLUCINATION` / `IRRELEVANT` / `CONFLICTING` / `ALREADY_FIXED`), de-dups findings that recurred across rounds, lints + tests, commits the cleanup, and proceeds straight to CI — **without** requesting another review. A PR that never accrued any minor findings makes this a no-op.
+
 ### 7. Check CI before merge
 
-Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails — reads the failed run's logs, fixes the cause, returns to step 6. Stops after 2 failed attempts on the same check.
+Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails — reads the failed run's logs, fixes the cause, commits the fix, and re-checks (back to this step). Stops after 2 failed attempts on the same check.
 
 ### 8. Finalize
 
