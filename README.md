@@ -129,7 +129,7 @@ Reached only on the final cycle — when a round has no `FIX` verdicts. Since th
 
 ### 7. Check CI before merge
 
-Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails — reads the failed run's logs, fixes the cause, returns to step 6. Stops after 2 failed attempts on the same check.
+Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails — reads the failed run's logs, fixes the cause, commits the fix, and re-checks (back to this step). Stops after 2 failed attempts on the same check.
 
 ### 8. Finalize
 
