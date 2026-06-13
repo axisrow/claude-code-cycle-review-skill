@@ -23,6 +23,8 @@ commands/cr.md                        # /cr alias for /cycle-review
 - Claude usage-limit is handled in triage, not a separate step: a usage-limit message means "Claude did not review" (not a finding); proceed on Codex if it reviewed, else stop. Never wait for the limit to reset
 - Safety invariant lives in step-4 finalize: never merge unless at least one reviewer actually reviewed this round; `ERROR` from step 3 or bot silence ⇒ stop (an empty triage is not approval)
 - Completeness gate (step 1.5): before requesting review, verify each PR implements its linked issue's design 100% (read the issue, checklist the design, verify the diff, close gaps test-first). Bots check code correctness, not completeness against the issue — don't burn a review round on a half-finished PR
+- Final cleanup pass (step 6.5): the round with no `FIX` verdicts is the last cycle. Before CI+merge, apply ALL accumulated minor findings — every genuine `SKIP` plus reasonable nice-to-haves — gathered from EVERY prior round (not just the last), de-duped; exclude `HALLUCINATION`/`IRRELEVANT`/`CONFLICTING`/`ALREADY_FIXED`. Lint+test+commit, then go straight to merge — no extra review round for the cleanup
+- Max 3 cycles per PR (one cycle = one steps 2–6 round). If a 3rd cycle still has `FIX` verdicts, stop instead of looping a 4th time: summarize the open findings and ask the user to narrow scope (move some out of scope into a follow-up issue/PR, or rethink). Cap only bites when findings persist; a clean 1st/2nd round finalizes normally
 - All `gh` commands need `dangerouslyDisableSandbox: true` (sandbox blocks TLS to api.github.com)
 - Skill uses Agent tool for comment triage (subagent)
 - Language: skill prompts in English, responds in user's language

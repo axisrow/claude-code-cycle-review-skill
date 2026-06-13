@@ -111,7 +111,9 @@ Collects comments from **all reviewers** (bot and human) — both issue comments
 | `CONFLICTING` | Quote the contradicting comment, ask for clarification |
 | `HALLUCINATION` | Reply with evidence from the codebase disproving the claim |
 
-Finalization happens when no `FIX` verdicts remain — the skill does not require an explicit `APPROVED` review state, since bot reviewers rarely emit it.
+When no `FIX` verdicts remain, this is the **final cycle** — the skill does not require an explicit `APPROVED` review state, since bot reviewers rarely emit it. It posts replies for the non-`FIX` comments and moves on to the final cleanup pass (step 6.5) before merging.
+
+**Hard cap of 3 cycles.** A cycle is one review-request → triage → fix round. If a 3rd cycle still surfaces `FIX` verdicts, the skill stops instead of looping a 4th time — three rounds with findings still open means the PR isn't converging. It hands back to you with a summary of the still-open findings and a suggestion to narrow scope: move some out of scope into a follow-up issue/PR so the core change can merge, or rethink the approach. The cap only triggers when findings persist; a clean 1st or 2nd round finalizes normally.
 
 ### 5. Fix issues
 
@@ -120,6 +122,10 @@ Applies fixes for `FIX` verdicts only. Runs linter and tests before proceeding.
 ### 6. Commit & push
 
 Conventional commit message, push to remote, return to step 2.
+
+### 6.5. Final cleanup pass (last cycle)
+
+Reached only on the final cycle — when a round has no `FIX` verdicts. Since there's no review round after this one, the skill spends one pass applying **all the minor findings deferred across every previous round** (not just the last): every genuine `SKIP` cosmetic/style/naming nitpick plus any reasonable nice-to-have suggestion the reviewers made. It excludes the verdicts with nothing to fix (`HALLUCINATION` / `IRRELEVANT` / `CONFLICTING` / `ALREADY_FIXED`), de-dups findings that recurred across rounds, lints + tests, commits the cleanup, and proceeds straight to CI — **without** requesting another review. A PR that never accrued any minor findings makes this a no-op.
 
 ### 7. Check CI before merge
 
