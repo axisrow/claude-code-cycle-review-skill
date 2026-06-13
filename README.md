@@ -2,7 +2,7 @@
 
 > [Русская версия](README.ru.md)
 
-Automated PR review cycle for Claude Code. On first run it asks which review bots you have (`@claude`, `@codex`, or both). Plans a merge strategy when several PRs are open, requests a code review from every configured reviewer, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval — then squash-merges.
+Automated PR review cycle for Claude Code. On first run it asks which review bots you have (`@claude`, `@codex`, or both). Plans a merge strategy when several PRs are open, verifies each PR implements its linked issue 100% before review, requests a code review from every configured reviewer, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval — then squash-merges.
 
 ## Installation
 
@@ -75,6 +75,12 @@ When no config exists (or `onboard` is passed), asks which bots are available (`
 ### 1. Multi-PR strategy
 
 When several of your PRs are open, the skill maps file overlaps and PR stacks, then announces the merge order autonomously (earliest first when overlapping; any order when independent). You can interrupt and override.
+
+### 1.5. Verify the issue is implemented 100% (before review)
+
+Before pinging the bots, the skill checks that each PR actually implements its linked issue's full design — not just that the code compiles. It reads the linked issue (`Closes #N`), turns the design into a checklist, and verifies every deliverable (each output format, flag, marker, edge case) is present in the diff. Any gap is closed test-first and pushed **before** the review starts.
+
+Why up front: review bots judge whether the *code* is correct, not whether it's *complete* against the issue — both bots can approve a PR that ships only half the design. Catching that here avoids burning a review round (or merging an incomplete issue). If the gap is large or the design is ambiguous, the skill surfaces the missing deliverables and asks how to proceed.
 
 ### 2. Request review
 

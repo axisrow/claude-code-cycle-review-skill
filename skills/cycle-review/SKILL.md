@@ -16,7 +16,7 @@ If `$ARGUMENTS` contains the standalone command token `onboard`, or the legacy f
 
 ## Cycle
 
-Run step 0 (onboarding) once at the start of every invocation, then repeat steps 2–6 until the PR has no `FIX` verdicts, then run step 7 (CI) and step 8 (merge).
+Run step 0 (onboarding) once at the start of every invocation. Then, for each PR, run step 1.5 (verify the PR implements its linked issue 100% — fix any gap BEFORE asking the bots), repeat steps 2–6 until the PR has no `FIX` verdicts, then run step 7 (CI) and step 8 (merge).
 
 ### 0. Onboarding — which reviewers are available (run once per invocation)
 
@@ -108,6 +108,35 @@ Skip this step only when there is exactly one PR to handle (single-PR run, no ot
    The user can interrupt and override; otherwise the plan stands.
 
 5. After each successful merge in step 8, return here: pop the merged PR from the queue, recompute file overlap for the rest (the codebase has changed), and continue with the next PR.
+
+### 1.5. Verify the PR implements its linked issue 100% (before any review)
+
+Run this **once per PR, before step 2** — do NOT ask the bots to review a half-finished PR. Review bots check whether the *code* is correct, not whether it is *complete* relative to the issue's design; a PR can be approved by both bots and still ship only half of what the issue asked for. Catch that here, up front, not after a wasted review round (or after merging an incomplete issue).
+
+1. **Find the linked issue.** A repo convention may require a closing keyword (`Closes #N`) in every PR. Read the PR body and the structured closing references:
+   ```bash
+   gh pr view <PR> --json body,closingIssuesReferences \
+     --jq '{body, issues: [.closingIssuesReferences[].number]}'
+   ```
+   If there is no linked issue (e.g. a pure refactor/chore with none) — skip this step and go to step 2.
+
+2. **Read the issue's design in full:**
+   ```bash
+   gh issue view <N> --json title,body --jq '{title, body}'
+   ```
+   Extract every concrete deliverable the design specifies — each output format, flag, marker, edge case, file the issue names. Treat the design section as a checklist, not a vibe.
+
+3. **Confirm each deliverable is actually implemented.** Read the changed code and `grep` the repo to verify every item on that checklist is present in this PR's diff (not merely planned, not "mostly"). A design that lists two markers/flags/outputs and a PR that ships one is a **gap**, even if the shipped half is flawless.
+
+4. **If a gap exists — close it now (before review):**
+   - Implement the missing pieces test-first (write the failing test, then the code), following the repo's conventions.
+   - Run the repo's linter and full test suite green.
+   - Commit (conventional-commits style) and push to the PR branch.
+   - Only then proceed to step 2. The bots now review a complete PR in one pass.
+
+   If the gap is large or the issue's design is ambiguous, surface it to the user (with the specific missing deliverables) and ask how to proceed rather than guessing.
+
+5. If the PR fully implements the issue — proceed to step 2.
 
 ### 2. Request review
 
@@ -240,7 +269,7 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - return to step 2 with the next PR.
 
 ## Important
-- Reviewers are configured once via onboarding (step 0) and stored globally at `~/.claude/cycle-review/config.json`. Re-run onboarding with `/cr onboard` (legacy: `--onboard` or `--reconfigure`). Never hardcode `@claude` — always drive steps 2–3 from the configured reviewers list.
+- **Verify completeness before review (step 1.5).** For every PR with a linked issue, confirm the PR implements the issue's design 100% BEFORE requesting a review. Bots check code correctness, not completeness against the issue — they will happily approve a PR that ships only half the design. Read the issue, turn its design into a checklist, verify each item in the diff, and close any gap (test-first) before step 2. Never start the review loop on a half-finished issue.
 - When both reviewers are configured, ping them in **one** comment whose body starts with `@claude @codex`. With a single reviewer, use just that mention.
 - Codex is slower than Claude (~5 min vs ~2 min): use the per-reviewer initial wait / max wait from the step 0 table, never Claude's window for Codex.
 - If Claude hits its usage limit (step 3.4): when Codex is configured, drop Claude for this run and continue on Codex; when Codex is not configured, just notify the user the limit is exhausted and stop — do **not** wait for the limit to reset.
