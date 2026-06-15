@@ -2,7 +2,12 @@
 
 > [Русская версия](README.ru.md)
 
-Automated PR review cycle for Claude Code. On first run it asks which review bots you have (`@claude`, `@codex`, or both). Plans a merge strategy when several PRs are open, verifies each PR implements its linked issue 100% before review, requests a code review from every configured reviewer, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval — then squash-merges.
+Automated PR review cycle for Claude Code, with **two review modes**:
+
+- **Cloud** (default) — pings the GitHub review bots you have (`@claude`, `@codex`, or both), waits for them to post on the PR, triages their comments, fixes, and runs autonomously through CI and squash-merge.
+- **Local** — reviews with an in-process **Claude subagent** that reads the PR diff directly (no bot ping, no waiting on GitHub). It records each round's verdicts as a PR comment, fixes, commits, and pushes — but is **review-only on merge**: it never merges on its own; you trigger the merge when you're ready. Local mode is **Claude Code only** (Codex has no equivalent local plugin), so it never involves Codex.
+
+On first run it asks which review bots you have and your default mode. It also plans a merge strategy when several PRs are open, verifies each PR implements its linked issue 100% before review, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval.
 
 ## Installation
 
@@ -31,17 +36,22 @@ This sets up the GitHub App and CI so Claude Code can review code and edit comme
 ## Usage
 
 ```
-/cycle-review [pr-numbers...] [onboard]
-/cr           [pr-numbers...] [onboard]
+/cycle-review [local|cloud] [pr-numbers...] [onboard]
+/cr           [local|cloud] [pr-numbers...] [onboard]
 ```
 
 Both forms are equivalent — `/cr` is a short alias.
 
 If no PR numbers are provided, the skill auto-detects the current PR from the branch and additionally enumerates your other open PRs to plan a merge strategy. Numbers can be passed in any free-form format (`/cr 20 21 25`, `/cr 20, 21, 25`, etc.). Other authors' PRs are never auto-included; pass them explicitly to opt in.
 
-## Reviewer onboarding
+A leading `local` or `cloud` token (also `--local` / `--cloud`) forces that mode for the run, overriding your saved default — e.g. `/cr local 58` reviews PR #58 locally, `/cr 58` uses your default mode.
 
-On **first run** the skill asks which review bots you have installed: `@claude`, `@codex`, or both. The choice is stored globally (once per user) at:
+## Onboarding (reviewers + default mode)
+
+On **first run** the skill asks two things and stores them globally (once per user):
+
+1. **Which review bots you have** — `@claude`, `@codex`, or both (used by cloud mode).
+2. **Your default review mode** — `cloud` (ping GitHub bots, autonomous through merge) or `local` (in-process Claude subagent, never auto-merges).
 
 ```
 ~/.claude/cycle-review/config.json
@@ -50,17 +60,18 @@ On **first run** the skill asks which review bots you have installed: `@claude`,
 ```json
 {
   "reviewers": ["@claude", "@codex"],
-  "version": 1
+  "mode": "cloud",
+  "version": 2
 }
 ```
 
-From then on the skill silently uses this list: it pings each configured reviewer in the review-request step and waits for each of them to respond. To change the choice later, run the short command:
+The saved `mode` is just the default — a `local`/`cloud` flag always overrides it per run. To change either choice later, run:
 
 ```
 /cr onboard
 ```
 
-The legacy `--onboard` and `--reconfigure` forms remain supported.
+The legacy `--onboard` and `--reconfigure` forms remain supported. A pre-existing `version: 1` config (no `mode` field) stays valid and is treated as `cloud` until you re-onboard.
 
 The file is global (not in the reviewed repo), so it never clutters your projects and is reused across all repositories.
 
@@ -84,17 +95,18 @@ Why up front: review bots judge whether the *code* is correct, not whether it's 
 
 ### 2. Request review
 
-Pings **all configured reviewers in a single comment** — the body starts with every configured mention (`@claude @codex` when both are on, or just one), asking them to focus on critical issues only (bugs, security, logic errors, data loss, performance). Cosmetic nitpicks are explicitly discouraged.
+**Cloud:** pings **all configured reviewers in a single comment** — the body starts with every configured mention (`@claude @codex` when both are on, or just one), asking them to focus on critical issues only (bugs, security, logic errors, data loss, performance). Cosmetic nitpicks are explicitly discouraged.
 
-### 3. Wait for reviewer response
+**Local:** spawns an in-process **Claude subagent** (Agent tool) that reads `gh pr diff` and the current contents of the touched files, reviews to the same critical-only bar, verifies each claim against the real code, and returns structured findings. No bot is pinged and there's no GitHub wait — step 3 is skipped and the findings go straight to triage (step 4).
 
-Waiting is handled by **one unified driver** (`skills/cycle-review/wait-for-reviews.sh`) instead of an ad-hoc loop reinvented each run. Every tick it `sleep`s, re-reads **all** comments from **all** bots, and detects completion from each bot's latest comment **body** — never from a comment count.
+### 3. Wait for reviewer response *(cloud mode only)*
 
-- **Why body, not count**: Claude **always edits its single comment in place** rather than posting a new one. A count-based wait ("until the bot has more than one comment") therefore hangs forever — the exact bug that once stalled a PR. The body check (`Claude finished`) handles the in-place edit correctly.
-- **Idempotent per PR**: the wait state is persisted (keyed by `owner/repo/PR`). If the loop is interrupted — a turn boundary, context compaction, a lost background task — re-running the same command **resumes** instead of restarting: reviewers already settled aren't re-awaited and the timeout counts from the original start. A `RESET=1` flag begins a fresh wait for the next review round.
-- **Per-reviewer timing** (Codex is slower, ~5 min vs ~2 min): Claude times out at 7 min, Codex at 12 min. Poll interval 30s. All configurable via env.
-- **Codex completion**: a settled review/comment appearing instead of a progress placeholder.
-- **Claude usage limit**: if Claude's review fails because the account hit its usage cap, then — if Codex is configured — the run drops Claude and continues on Codex only; if Codex is not configured, it notifies you that the limit is exhausted and stops (it never waits for the limit to reset).
+Waiting is handled by **one small committed driver** (`skills/cycle-review/wait-for-reviews.sh`, ~50 lines) instead of an ad-hoc loop reinvented each run. It is a deliberately dumb waiter: it just `sleep`s a single fixed window (`WAIT`, default 300s — covers Codex's ~5 min and Claude's ~2 min), then probes that the GitHub API is reachable, and prints exactly one line:
+
+- `DONE` — the window elapsed and the API is up. Triage (step 4) then reads every comment itself and decides what actually happened.
+- `ERROR` — the PR's comments couldn't be read after several tries (a sustained API outage — expired auth, rate limit, network). This is **not** "no findings": the cycle stops and you're told to check e.g. `gh auth status`. An outage is never allowed to masquerade as approval.
+
+It does **not** detect who finished, parse comment bodies, track per-reviewer state, or resume — there is no state file and nothing to reset. **All** interpretation (who replied, relevance, hallucinations, a Claude usage-limit message) happens in the step-4 triage, which reads all three comment surfaces itself. Each new round just posts a fresh request (step 2) and runs the waiter again; if the background run is lost, re-running it is harmless. This replaced an over-engineered ~290-line version whose completion-detection/resume machinery kept generating its own bugs (for instance a count-based wait once hung forever, because Claude edits its single comment in place rather than posting a new one).
 
 Run via the background, sandbox-disabled `Bash` (the GitHub API isn't reachable from the sandbox); a leading `sleep N && …` is blocked, but the `sleep` *inside* the driver loop is fine.
 
@@ -111,7 +123,9 @@ Collects comments from **all reviewers** (bot and human) — both issue comments
 | `CONFLICTING` | Quote the contradicting comment, ask for clarification |
 | `HALLUCINATION` | Reply with evidence from the codebase disproving the claim |
 
-When no `FIX` verdicts remain, this is the **final cycle** — the skill does not require an explicit `APPROVED` review state, since bot reviewers rarely emit it. It posts replies for the non-`FIX` comments and moves on to the final cleanup pass (step 6.5) before merging.
+In **local** mode the subagent findings have no GitHub comment to reply to, so each round the skill posts **one triage-summary comment** on the PR recording the verdicts — the local review is the reviewer of record.
+
+When no `FIX` verdicts remain, this is the **final cycle** — the skill does not require an explicit `APPROVED` review state, since bot reviewers rarely emit it. It posts replies (cloud) or the summary (local) for the non-`FIX` comments and moves on to the final cleanup pass (step 6.5). After cleanup, **cloud** proceeds to CI and merge; **local** stops and reports — it does not auto-merge.
 
 **Hard cap of 3 cycles.** A cycle is one review-request → triage → fix round. If a 3rd cycle still surfaces `FIX` verdicts, the skill stops instead of looping a 4th time — three rounds with findings still open means the PR isn't converging. It hands back to you with a summary of the still-open findings and a suggestion to narrow scope: move some out of scope into a follow-up issue/PR so the core change can merge, or rethink the approach. The cap only triggers when findings persist; a clean 1st or 2nd round finalizes normally.
 
@@ -127,24 +141,24 @@ Conventional commit message, push to remote, return to step 2.
 
 Reached only on the final cycle — when a round has no `FIX` verdicts. Since there's no review round after this one, the skill spends one pass applying **all the minor findings deferred across every previous round** (not just the last): every genuine `SKIP` cosmetic/style/naming nitpick plus any reasonable nice-to-have suggestion the reviewers made. It excludes the verdicts with nothing to fix (`HALLUCINATION` / `IRRELEVANT` / `CONFLICTING` / `ALREADY_FIXED`), de-dups findings that recurred across rounds, lints + tests, commits the cleanup, and proceeds straight to CI — **without** requesting another review. A PR that never accrued any minor findings makes this a no-op.
 
-### 7. Check CI before merge
+### 7. Check CI before merge *(cloud mode only)*
 
-Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails — reads the failed run's logs, fixes the cause, commits the fix, and re-checks (back to this step). Stops after 2 failed attempts on the same check.
+Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails — reads the failed run's logs, fixes the cause, commits the fix, and re-checks (back to this step). Stops after 2 failed attempts on the same check. Local mode never reaches this step.
 
-### 8. Finalize
+### 8. Finalize *(cloud mode only)*
 
-When approved with no outstanding comments and CI green — squash-merge and clean up the branch. If a multi-PR queue is active, recompute overlaps and continue with the next PR.
+**Cloud:** when approved with no outstanding comments and CI green — squash-merge and clean up the branch. If a multi-PR queue is active, recompute overlaps and continue with the next PR.
+
+**Local:** does **not** merge — it's review-only on merge by design. After the cleanup pass it stops and reports what was fixed; you trigger the merge yourself when ready.
 
 ## Key Features
 
-- **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `/cr onboard`
-- **Unified, body-based waiting** — one committed driver reads all bot comments each tick and detects completion by comment body, so Claude's in-place comment edits never cause the count-based hang
-- **Resumable waiting** — wait state is persisted per PR, so an interrupted cycle continues where it left off instead of restarting the wait from scratch
-- **Per-reviewer timing** — knows Codex is slower than Claude (~5 min vs ~2 min) and waits on each reviewer's own schedule
+- **Two review modes** — `cloud` (GitHub bots, autonomous through merge) and `local` (in-process Claude subagent, never auto-merges; Claude Code only). Saved as a default in the config and overridable per run with a leading `local`/`cloud` flag
+- **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both plus a default mode, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `/cr onboard`
+- **Simple fixed-window waiting (cloud)** — one ~50-line committed driver waits a single window then probes the API, printing only `DONE` / `ERROR`; it tracks no per-reviewer state and never resumes — all interpretation lives in triage. An outage (`ERROR`) is never mistaken for "no findings"
 - **Claude usage-limit fallback** — if Claude hits its usage cap, continues on Codex when configured, otherwise notifies and stops without waiting for the limit to reset
 - **Multi-PR planning** — detects file overlap and PR stacks, picks merge order
-- **Sandbox-aware waiting** — uses `gh run watch` and background polling; never relies on blocked `sleep N && ...` patterns
-- **Smart polling** — tracks the reviewer's comment by ID instead of waiting a fixed time
+- **Sandbox-aware waiting** — runs the waiter and `gh` calls in the background with the sandbox disabled; never relies on blocked leading `sleep N && ...` patterns
 - **Multi-reviewer support** — processes comments from all reviewers, not just the bot
 - **Claim verification** — verifies every reviewer claim against the actual codebase before fixing
 - **Hallucination detection** — catches non-existent functions, wrong line numbers, false conventions
