@@ -1,7 +1,7 @@
 {
   "name": "cycle-review",
-  "description": "Automated PR review cycle — request review, fix issues, repeat until approved, then merge",
-  "version": "0.4.2",
+  "description": "Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Cloud (GitHub bots) or local (in-process Claude subagent) review mode.",
+  "version": "0.4.3",
   "author": {
     "name": "axisrow"
   },
