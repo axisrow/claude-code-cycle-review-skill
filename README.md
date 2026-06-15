@@ -14,7 +14,6 @@ On first run it asks which review bots you have and your default mode. It also p
 ```bash
 git clone https://github.com/axisrow/claude-code-cycle-review-skill.git
 cp -r claude-code-cycle-review-skill/skills/cycle-review ~/.claude/skills/
-cp -r claude-code-cycle-review-skill/commands ~/.claude/
 ```
 
 ### Prerequisites
@@ -37,14 +36,11 @@ This sets up the GitHub App and CI so Claude Code can review code and edit comme
 
 ```
 /cycle-review [local|cloud] [pr-numbers...] [onboard]
-/cr           [local|cloud] [pr-numbers...] [onboard]
 ```
 
-Both forms are equivalent — `/cr` is a short alias.
+If no PR numbers are provided, the skill auto-detects the current PR from the branch and additionally enumerates your other open PRs to plan a merge strategy. Numbers can be passed in any free-form format (`/cycle-review 20 21 25`, `/cycle-review 20, 21, 25`, etc.). Other authors' PRs are never auto-included; pass them explicitly to opt in.
 
-If no PR numbers are provided, the skill auto-detects the current PR from the branch and additionally enumerates your other open PRs to plan a merge strategy. Numbers can be passed in any free-form format (`/cr 20 21 25`, `/cr 20, 21, 25`, etc.). Other authors' PRs are never auto-included; pass them explicitly to opt in.
-
-A leading `local` or `cloud` token (also `--local` / `--cloud`) forces that mode for the run, overriding your saved default — e.g. `/cr local 58` reviews PR #58 locally, `/cr 58` uses your default mode.
+A leading `local` or `cloud` token (also `--local` / `--cloud`) forces that mode for the run, overriding your saved default — e.g. `/cycle-review local 58` reviews PR #58 locally, `/cycle-review 58` uses your default mode.
 
 ## Onboarding (reviewers + default mode)
 
@@ -68,7 +64,7 @@ On **first run** the skill asks two things and stores them globally (once per us
 The saved `mode` is just the default — a `local`/`cloud` flag always overrides it per run. To change either choice later, run:
 
 ```
-/cr onboard
+/cycle-review onboard
 ```
 
 The legacy `--onboard` and `--reconfigure` forms remain supported. A pre-existing `version: 1` config (no `mode` field) stays valid and is treated as `cloud` until you re-onboard.
@@ -154,7 +150,7 @@ Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails
 ## Key Features
 
 - **Two review modes** — `cloud` (GitHub bots, autonomous through merge) and `local` (in-process Claude subagent, never auto-merges; Claude Code only). Saved as a default in the config and overridable per run with a leading `local`/`cloud` flag
-- **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both plus a default mode, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `/cr onboard`
+- **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both plus a default mode, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `/cycle-review onboard`
 - **Simple fixed-window waiting (cloud)** — one ~50-line committed driver waits a single window then probes the API, printing only `DONE` / `ERROR`; it tracks no per-reviewer state and never resumes — all interpretation lives in triage. An outage (`ERROR`) is never mistaken for "no findings"
 - **Claude usage-limit fallback** — if Claude hits its usage cap, continues on Codex when configured, otherwise notifies and stops without waiting for the limit to reset
 - **Multi-PR planning** — detects file overlap and PR stacks, picks merge order

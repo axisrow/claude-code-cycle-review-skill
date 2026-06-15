@@ -1,6 +1,6 @@
 ---
 name: cycle-review
-description: Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Cloud mode pings GitHub review bots; local mode reviews with an in-process Claude subagent. Aliased as /cr.
+description: Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Cloud mode pings GitHub review bots; local mode reviews with an in-process Claude subagent.
 disable-model-invocation: true
 allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
 argument-hint: "[local|cloud] [pr-numbers...] [onboard]"
@@ -12,7 +12,7 @@ Automated PR review cycle until full approval, with multi-PR merge strategy plan
 
 PR numbers come from `$ARGUMENTS`. Parse them as a free-form string — accept any format (space-separated, comma-separated, prose like "twenty, twenty-one and twenty-five"). If `$ARGUMENTS` is empty — auto-detect the current PR from the branch via `gh pr view --json number -q .number`. Other authors' PRs are never included automatically; the user must pass their numbers explicitly.
 
-If `$ARGUMENTS` contains the standalone command token `onboard`, or the legacy flags `--onboard` / `--reconfigure`, strip that token out before parsing PR numbers and force the onboarding in step 0 to run again, overwriting the saved config. Treat `onboard` as the preferred user-facing form, e.g. `/cr onboard`.
+If `$ARGUMENTS` contains the standalone command token `onboard`, or the legacy flags `--onboard` / `--reconfigure`, strip that token out before parsing PR numbers and force the onboarding in step 0 to run again, overwriting the saved config. Treat `onboard` as the preferred user-facing form, e.g. `/cycle-review onboard`.
 
 ## Review mode: cloud vs local
 
