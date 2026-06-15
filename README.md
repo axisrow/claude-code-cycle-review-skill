@@ -5,7 +5,7 @@
 Automated PR review cycle for Claude Code, with **two review modes**:
 
 - **Cloud** (default) — pings the GitHub review bots you have (`@claude`, `@codex`, or both), waits for them to post on the PR, triages their comments, fixes, and runs autonomously through CI and squash-merge.
-- **Local** — reviews with an in-process **Claude subagent** that reads the PR diff directly (no bot ping, no waiting on GitHub). It records each round's verdicts as a PR comment, fixes, commits, and pushes — but is **review-only on merge**: it never merges on its own; you trigger the merge when you're ready. Local mode is **Claude Code only** (Codex has no equivalent local plugin), so it never involves Codex.
+- **Local** — reviews with an in-process **Claude subagent** that reads the PR diff directly (no bot ping, no waiting on GitHub). The Claude subagent always runs; when `@codex` is in your reviewers list, **Codex also reviews locally** via its companion script (run in parallel, findings merged before triage). It records each round's verdicts as a PR comment, fixes, commits, and pushes — but is **review-only on merge**: it never merges on its own; you trigger the merge when you're ready. If `@codex` is configured but Codex isn't installed/logged in, local mode stops and asks you to `codex login` rather than silently reviewing with Claude alone (fail-closed).
 
 On first run it asks which review bots you have and your default mode. It also plans a merge strategy when several PRs are open, verifies each PR implements its linked issue 100% before review, intelligently triages reviewer comments (from bots and humans), applies fixes, and repeats until approval.
 
@@ -93,7 +93,7 @@ Why up front: review bots judge whether the *code* is correct, not whether it's 
 
 **Cloud:** pings **all configured reviewers in a single comment** — the body starts with every configured mention (`@claude @codex` when both are on, or just one), asking them to focus on critical issues only (bugs, security, logic errors, data loss, performance). Cosmetic nitpicks are explicitly discouraged.
 
-**Local:** spawns an in-process **Claude subagent** (Agent tool) that reads `gh pr diff` and the current contents of the touched files, reviews to the same critical-only bar, verifies each claim against the real code, and returns structured findings. No bot is pinged and there's no GitHub wait — step 3 is skipped and the findings go straight to triage (step 4).
+**Local:** spawns an in-process **Claude subagent** (Agent tool) that reads `gh pr diff` and the current contents of the touched files, reviews to the same critical-only bar, verifies each claim against the real code, and returns structured findings. When `@codex` is configured, it *also* runs Codex locally in parallel — its companion script reviews the PR diff (`adversarial-review --base <PR base>`) in the background while the subagent works, and both sets of findings are merged before triage (Codex's claims are re-verified in triage, not trusted). No bot is pinged and there's no GitHub wait — step 3 is skipped and the findings go straight to triage (step 4). If `@codex` is configured but Codex is unavailable, local mode stops (fail-closed) and asks you to `codex login`.
 
 ### 3. Wait for reviewer response *(cloud mode only)*
 
@@ -149,7 +149,7 @@ Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails
 
 ## Key Features
 
-- **Two review modes** — `cloud` (GitHub bots, autonomous through merge) and `local` (in-process Claude subagent, never auto-merges; Claude Code only). Saved as a default in the config and overridable per run with a leading `local`/`cloud` flag
+- **Two review modes** — `cloud` (GitHub bots, autonomous through merge) and `local` (in-process Claude subagent + Codex companion when `@codex` is configured, never auto-merges). Saved as a default in the config and overridable per run with a leading `local`/`cloud` flag
 - **Reviewer onboarding** — on first run asks `@claude` / `@codex` / both plus a default mode, stores the choice globally at `~/.claude/cycle-review/config.json`, re-runnable with `/cycle-review onboard`
 - **Simple fixed-window waiting (cloud)** — one ~50-line committed driver waits a single window then probes the API, printing only `DONE` / `ERROR`; it tracks no per-reviewer state and never resumes — all interpretation lives in triage. An outage (`ERROR`) is never mistaken for "no findings"
 - **Claude usage-limit fallback** — if Claude hits its usage cap, continues on Codex when configured, otherwise notifies and stops without waiting for the limit to reset
