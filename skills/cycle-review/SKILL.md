@@ -197,11 +197,24 @@ No bot is pinged and no GitHub wait happens. The **Claude subagent always runs**
 **Launch both in parallel, then wait for both:**
 
 1. **Start Codex first (background) when `@codex` is configured**, so it runs while the Claude subagent works:
-   - **Discover the companion path at runtime — never hardcode the version.** Pick the newest installed copy:
+   - **Resolve the companion path from the installed-plugins manifest — never hardcode the source namespace or path layout.** `~/.claude/plugins/installed_plugins.json` is the canonical plugin→installPath index (`{ "version": 2, "plugins": { "<name>@<marketplace>": [{ installPath, version, scope, lastUpdated, ... }] } }`). A plugin key may have several entries (user/local/project scope), so pick the **newest `lastUpdated`** — that is the actively installed version, NOT the newest version sitting in the file cache (the cache holds leftovers the GC sweeps away; `.in_use/` PID-markers only protect from sweep, they don't pick the version). The codex plugin can appear under different names/namespaces (`codex@openai-codex` upstream vs `codex-fork@etopro-plugins` fork) and two path layouts (fork is a meta-plugin wrapping a `codex` sub-plugin), so match by name and probe both layouts, verifying the file exists:
      ```bash
-     COMPANION=$(ls -1 "$HOME"/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs 2>/dev/null | sort -V | tail -1)
+     COMPANION=$(jq -r '
+         .plugins | to_entries[]
+         | select(.key | split("@")[0] | test("codex"))
+         | .value[]
+         | "\(.lastUpdated // .installedAt // "")\t\(.installPath)"
+       ' "$HOME"/.claude/plugins/installed_plugins.json 2>/dev/null \
+       | sort -r | while IFS=$'\t' read -r _ ip; do
+           [ -n "$ip" ] || continue
+           for cand in "$ip/plugins/codex/scripts/codex-companion.mjs" "$ip/scripts/codex-companion.mjs"; do
+             [ -f "$cand" ] && echo "$cand"
+           done
+         done | sort -u | tail -1)
      ```
-     If `$COMPANION` is empty, Codex is not installed — treat as the fail-closed case in step 4.
+     If `$COMPANION` is empty, the codex plugin is **not installed** (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 4.
+
+     > Why not `${CLAUDE_PLUGIN_ROOT}`? That env var is substituted by Claude Code only inside the *owning* plugin's commands/hooks — in a cycle-review session it points at cycle-review (or is unset), so it can't address a sibling plugin. `installed_plugins.json` is the only cross-plugin source of truth for install paths.
    - **Get the PR's base ref** (this is what makes `--base` equal the PR diff, since local mode is checked out on the PR branch):
      ```bash
      BASE=$(gh pr view <PR> --json baseRefName -q .baseRefName)   # Bash, dangerouslyDisableSandbox: true
@@ -218,7 +231,11 @@ No bot is pinged and no GitHub wait happens. The **Claude subagent always runs**
    - Review for the same critical-only bar: bugs, security vulnerabilities, logical errors, data-loss risks, performance problems. Do NOT nitpick style/naming/formatting/subjective preferences as `FIX`-level; note genuine minor improvements separately (they feed the step-6.5 cleanup pass).
    - Return a structured list of findings, each with: a short title, the `path` and `line` (when locatable), severity (`critical` vs `minor`), the concrete claim, and the evidence it was verified against. The subagent does its own claim-verification before emitting a finding — a finding whose underlying claim it could not confirm in the code must be dropped or marked unverified, never surfaced as critical.
 3. **After the subagent returns, collect the Codex background output** (only if Codex was launched). Use `BashOutput` on the recorded background id; if it has not finished, wait for it (poll `BashOutput`, or use the Monitor/until pattern) — do not proceed until the background bash has exited. Capture both its stdout (the JSON) and its **exit code**.
-4. **Fail-closed check (Codex configured but unavailable).** If `$COMPANION` was empty, OR the background bash exited **non-zero** (the companion writes an install/login error to stderr — e.g. `npm install -g @openai/codex` or `codex login`), then **STOP**: report the exact stderr to the user and ask them to install/log in (`codex login`), then re-run. Do **NOT** silently continue on the Claude subagent alone — this mirrors the cloud/local "never let silence look like approval" invariant. (When `@codex` is *not* configured, there is no Codex run and nothing to fail-closed on.)
+4. **Fail-closed check (Codex configured but unavailable).** Two distinct failure shapes, both STOP:
+   - **Companion not found** (`$COMPANION` was empty): the codex plugin is not installed. STOP and tell the user: *"Codex companion not found in `~/.claude/plugins/installed_plugins.json`. Install the codex plugin (e.g. via `/plugin`), then re-run."* Do **NOT** suggest `codex login` here — there is nothing to log in to yet.
+   - **Companion found but the background bash exited non-zero**: the companion runs but reports an install/login error to stderr (e.g. `npm install -g @openai/codex` or `codex login`). STOP, report the exact stderr, and ask the user to install/log in (`codex login`), then re-run.
+
+   In both cases, do **NOT** silently continue on the Claude subagent alone — this mirrors the cloud/local "never let silence look like approval" invariant. (When `@codex` is *not* configured, there is no Codex run and nothing to fail-closed on.)
 5. **Parse Codex JSON and map to the common finding shape.** The companion's `--json` stdout is an object whose **`.result`** field holds `{ verdict, summary, findings[], next_steps[] }`. Read `.result.findings[]` (e.g. `<json> | jq '.result.findings'`). If `.result` is absent but `.parseError` is set, surface that Codex produced unparseable output and treat it like an unavailable reviewer (fail-closed — do not silently drop). Map each Codex finding to the same shape the Claude subagent returns so step 4 triages them uniformly:
    | Codex field | Common finding field |
    |---|---|
