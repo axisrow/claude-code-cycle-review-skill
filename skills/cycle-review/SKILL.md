@@ -1,8 +1,8 @@
 ---
 name: cycle-review
-description: Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Cloud mode pings GitHub review bots; local mode reviews with an in-process Claude subagent, plus Codex locally when @codex is configured.
+description: Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Cloud mode pings GitHub review bots; local mode reviews with the built-in /review command, plus Codex locally when @codex is configured.
 disable-model-invocation: true
-allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
+allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent, Skill, AskUserQuestion
 argument-hint: "[local|cloud] [pr-numbers...] [onboard]"
 ---
 
@@ -21,7 +21,7 @@ The skill has **two review modes**. Pick the active one in step 0.1 before anyth
 | Mode | Who reviews | Network to bots? | Use when |
 |---|---|---|---|
 | **cloud** (default, original behavior) | GitHub bots `@claude` / `@codex` pinged in a PR comment | yes — waits for the bots to post on GitHub | you want the same reviewers a human teammate would see on the PR, and a fully autonomous loop through merge |
-| **local** | an in-process **Claude subagent** (Agent tool) reading `gh pr diff` directly — like the inline review the main loop does itself — **plus Codex (local companion) when `@codex` is configured** | no bot ping, no GitHub wait; only posts the findings as a PR comment afterwards | you want a fast review without waiting on GitHub bots, or the bots aren't installed. The Claude subagent **always** runs; **if `@codex` is in your reviewers list, Codex also reviews locally** via its companion script (run in parallel, findings merged). No GitHub bot ping either way |
+| **local** | the built-in **`/review`** command (Agent-tool-free — Claude Code's own PR-review mechanic) reviewing the PR, **plus Codex (local companion) when `@codex` is configured** | no bot ping, no GitHub wait; only posts the findings as a PR comment afterwards | you want a fast review without waiting on GitHub bots, or the bots aren't installed. `/review` **always** runs; **if `@codex` is in your reviewers list, Codex also reviews locally** via its companion script (run in parallel, findings merged). No GitHub bot ping either way |
 
 **Mode selection — flag overrides config, config is the default:**
 - A standalone leading token `local` or `cloud` in `$ARGUMENTS` (also accept `--local` / `--cloud`) forces that mode for this run and is stripped out before parsing PR numbers — exactly like the `onboard` token.
@@ -62,7 +62,7 @@ The skill needs two things from the user, stored once: which review bots they ha
 
 2. **Run onboarding.** Ask the user TWO `AskUserQuestion` questions (one tool call, two questions):
    - **Reviewers** (multi-select): `@claude`, `@codex` — which review bots they have (one or both). Used by cloud mode.
-   - **Default mode** (single-select): `cloud` (ping GitHub review bots, autonomous through merge) vs `local` (in-process Claude subagent reviews the diff, no bot ping, never auto-merges). This is just the default — a `local`/`cloud` flag always overrides it per run.
+   - **Default mode** (single-select): `cloud` (ping GitHub review bots, autonomous through merge) vs `local` (the built-in `/review` reviews the PR, no bot ping, never auto-merges). This is just the default — a `local`/`cloud` flag always overrides it per run.
 
    Do not free-text-parse either answer; use the structured picker.
 
@@ -87,9 +87,9 @@ Decide cloud vs local for this run, then remember it — every later branch (ste
 
 1. **Flag wins.** If `$ARGUMENTS` had a standalone leading `local` / `cloud` (or `--local` / `--cloud`) token, use that mode and remember it was stripped from PR-number parsing.
 2. **Else config.** Use the `mode` read in step 0.4 (`"cloud"` when the field is absent).
-3. **Announce it** so the run is self-documenting, e.g. `Review mode: local (in-process Claude subagent; will not auto-merge).` or `Review mode: cloud (pinging @claude @codex).`
+3. **Announce it** so the run is self-documenting, e.g. `Review mode: local (built-in /review; will not auto-merge).` or `Review mode: cloud (pinging @claude @codex).`
 
-In **local** mode no bots are pinged, but the **reviewers list still matters**: the Claude subagent always runs, and if the list contains `@codex`, Codex also reviews locally via its companion script (step 2b). `@claude`-only stays Claude-subagent-only. (The reviewers list read in step 0.4 is consulted by local step 2b too, not only cloud — no extra read is needed.)
+In **local** mode no bots are pinged, but the **reviewers list still matters**: the built-in `/review` always runs, and if the list contains `@codex`, Codex also reviews locally via its companion script (step 2b). `@claude`-only stays `/review`-only. (The reviewers list read in step 0.4 is consulted by local step 2b too, not only cloud — no extra read is needed.)
 
 **Where each reviewer posts** (useful for triage in step 4 — the step-3 waiter ignores this and just waits a fixed window):
 
@@ -190,13 +190,13 @@ gh pr comment <PR> --body "<MENTIONS> review. Focus on critical issues: bugs, se
 ```
 For example, with both configured the body starts with `@claude @codex review.`; with only Codex it starts with `@codex review.`. Run via `Bash` with `dangerouslyDisableSandbox: true`. Then go to step 3a (wait).
 
-#### 2b. Local mode — Claude subagent (plus Codex when configured)
+#### 2b. Local mode — built-in `/review` (plus Codex when configured)
 
-No bot is pinged and no GitHub wait happens. The **Claude subagent always runs**; if `@codex` is in the reviewers list (step 0.4), **Codex also reviews locally, in parallel**, and its findings are merged with the subagent's before triage. (`@codex`-only still runs the Claude subagent too — local mode always includes Claude; the reviewers list only *adds* Codex.)
+No bot is pinged and no GitHub wait happens. The **built-in `/review` always runs**; if `@codex` is in the reviewers list (step 0.4), **Codex also reviews locally, in parallel**, and its findings are merged with `/review`'s before triage. (`@codex`-only still runs `/review` too — local mode always includes Claude; the reviewers list only *adds* Codex.)
 
 **Launch both in parallel, then wait for both:**
 
-1. **Start Codex first (background) when `@codex` is configured**, so it runs while the Claude subagent works:
+1. **Start Codex first (background) when `@codex` is configured**, so it runs while `/review` works:
    - **Resolve the companion path from the installed-plugins manifest — never hardcode the source namespace or path layout.** `~/.claude/plugins/installed_plugins.json` is the canonical plugin→installPath index (`{ "version": 2, "plugins": { "<name>@<marketplace>": [{ installPath, version, scope, projectPath, lastUpdated, ... }] } }`). Filter carefully, because the chosen script runs with `dangerouslyDisableSandbox: true` (network) — a wrong pick can execute an unrelated plugin impersonating the reviewer:
      1. **Only `scope: "user"` entries.** A `user`-scoped install is globally enabled and valid in any repo. `local`/`project` entries are tied to another repo's `projectPath` and must NOT be eligible outside it — never run a plugin the user only enabled for a different project.
      2. **Explicit codex names only.** Match the plugin name (the part before `@`) against an allowlist of known codex plugins — `codex` (upstream `codex@openai-codex`) and `codex-fork` (`codex-fork@etopro-plugins`). A loose substring match (`codex`) risks catching an unrelated plugin whose name merely contains it.
@@ -230,18 +230,18 @@ No bot is pinged and no GitHub wait happens. The **Claude subagent always runs**
        "Critical-only review of PR #<PR>: bugs, security vulnerabilities, logical errors, data-loss risks, performance problems. Do NOT nitpick style, naming, formatting, or subjective preferences."
      ```
      Run via **`Bash` with `run_in_background: true`** *and* `dangerouslyDisableSandbox: true` (Codex needs network). `--wait` keeps it blocking *inside* the backgrounded bash, so the background handle completes only when Codex is done. Record the returned background shell id.
-2. **Spawn the Claude review subagent** with the Agent tool (the same engine cloud mode uses for triage, pointed at the diff). Because Codex is already running in the background, the two reviews overlap. The subagent must:
-   - Read the PR metadata and the full diff with `gh pr view <PR> --json title,body,...` and `gh pr diff <PR>` (run via Bash with `dangerouslyDisableSandbox: true`; the diff is read-only GitHub access).
-   - Read the **current** contents of every file the diff touches (not just the patch hunks) so claims are grounded in real code, and `grep` the repo to confirm any cross-file assertion.
-   - Review for the same critical-only bar: bugs, security vulnerabilities, logical errors, data-loss risks, performance problems. Do NOT nitpick style/naming/formatting/subjective preferences as `FIX`-level; note genuine minor improvements separately (they feed the step-6.5 cleanup pass).
-   - Return a structured list of findings, each with: a short title, the `path` and `line` (when locatable), severity (`critical` vs `minor`), the concrete claim, and the evidence it was verified against. The subagent does its own claim-verification before emitting a finding — a finding whose underlying claim it could not confirm in the code must be dropped or marked unverified, never surfaced as critical.
-3. **After the subagent returns, collect the Codex background output** (only if Codex was launched). Use `BashOutput` on the recorded background id; if it has not finished, wait for it (poll `BashOutput`, or use the Monitor/until pattern) — do not proceed until the background bash has exited. Capture both its stdout (the JSON) and its **exit code**.
+2. **Run the Claude review by invoking the built-in `/review` via the `Skill` tool** — do NOT spawn a custom review subagent. `/review` is the canonical Claude Code PR-review command (read-only, single-pass; maintained upstream), and this skill rides on its improvements instead of re-implementing review logic. Because Codex is already running in the background, the two reviews overlap.
+   - **Invoke via the `Skill` tool.** Call `Skill({ skill: "review", args: "<PR#>" })`. This is the ONLY programmatic path — do not try to type a literal `/review <PR>` into the chat (the model can't do that), do not shell out via Bash, do not spawn an Agent. `/review` is one of the built-ins explicitly exposed through the `Skill` tool (per `/skills` docs: `/init`, `/review`, `/security-review`). `Skill` is in this skill's `allowed-tools` for exactly this call.
+   - **Read the review directly — no parser, no steering, no format contract.** `/review` is read-only and posts nothing to GitHub; it writes its review as an assistant message in THIS skill's own context (verified empirically). You — the agent running the cycle — read that review with your own judgment and extract its findings into the common finding shape exactly the way you read any reviewer comment: each distinct issue the review raises → a finding with whatever `path`/`line` the review points at (often none), a short `title`, the concrete `claim`, and `evidence: "/review-reported; re-verify in triage"`. Tag each `reviewer: claude`. Do NOT try to coerce `/review` into a fixed line format — it writes free-form prose with sections/bullets, and that is fine; you triage prose the same way you triage a human or bot comment in step 4.
+3. **After `/review` has run (or its `Skill` call errored — see the fail-closed below), collect the Codex background output** (only if Codex was launched). Use `BashOutput` on the recorded background id; if it has not finished, wait for it (poll `BashOutput`, or use the Monitor/until pattern) — do not proceed until the background bash has exited. Capture both its stdout (the JSON) and its **exit code**.
 4. **Fail-closed check (Codex configured but unavailable).** Two distinct failure shapes, both STOP:
    - **Companion not found** (`$COMPANION` was empty): the codex plugin is not installed. STOP and tell the user: *"Codex companion not found in `~/.claude/plugins/installed_plugins.json`. Install the codex plugin (e.g. via `/plugin`), then re-run."* Do **NOT** suggest `codex login` here — there is nothing to log in to yet.
    - **Companion found but the background bash exited non-zero**: the companion runs but reports an install/login error to stderr (e.g. `npm install -g @openai/codex` or `codex login`). STOP, report the exact stderr, and ask the user to install/log in (`codex login`), then re-run.
 
-   In both cases, do **NOT** silently continue on the Claude subagent alone — this mirrors the cloud/local "never let silence look like approval" invariant. (When `@codex` is *not* configured, there is no Codex run and nothing to fail-closed on.)
-5. **Parse Codex JSON and map to the common finding shape.** The companion's `--json` stdout is an object whose **`.result`** field holds `{ verdict, summary, findings[], next_steps[] }`. Read `.result.findings[]` (e.g. `<json> | jq '.result.findings'`). If `.result` is absent but `.parseError` is set, surface that Codex produced unparseable output and treat it like an unavailable reviewer (fail-closed — do not silently drop). Map each Codex finding to the same shape the Claude subagent returns so step 4 triages them uniformly:
+   In both cases, do **NOT** silently continue on `/review` alone — a missing Codex review must not masquerade as approval. (When `@codex` is *not* configured, there is no Codex run and nothing to fail-closed on.)
+
+   **`/review` fail-closed (single rule):** if the `Skill` call errored or `/review` produced no review at all (empty / refused), no Claude review happened — STOP, do NOT finalize. A review that lists no issues is a clean review (proceed); a review that didn't happen is silence (stop). The invariant: **never finalize on silence** — a missing review is not a clean review.
+5. **Parse Codex JSON and map to the common finding shape.** The companion's `--json` stdout is an object whose **`.result`** field holds `{ verdict, summary, findings[], next_steps[] }`. Read `.result.findings[]` (e.g. `<json> | jq '.result.findings'`). If `.result` is absent but `.parseError` is set, surface that Codex produced unparseable output and treat it like an unavailable reviewer (fail-closed — do not silently drop). Map each Codex finding to the same common shape you read `/review`'s findings into (step 2) so step 4 triages them uniformly:
    | Codex field | Common finding field |
    |---|---|
    | `title` | `title` |
@@ -252,15 +252,26 @@ No bot is pinged and no GitHub wait happens. The **Claude subagent always runs**
    | "Codex-reported; re-verify in triage" | `evidence` |
 
    Tag each mapped finding with its source (`reviewer: codex`) so the step-4b summary can attribute it.
-6. **Merge** the Codex-mapped findings with the Claude subagent findings into one list. De-dup obvious overlaps by `path`+`line`+gist (keep the higher severity; note both reviewers flagged it). This merged list is the local "comment set" carried into step 4.
+6. **Merge** the Codex-mapped findings with the `/review` findings (parsed in step 2) into one list. De-dup obvious overlaps by `path`+`line`+gist (keep the higher severity; note both reviewers flagged it). This merged list is the local "comment set" carried into step 4.
+7. **Persist this round's merged findings to a per-run file** (so step 6.5 can re-read findings from EVERY prior round — `/review`'s output lives only in chat and is otherwise lost once the conversation moves on, and Codex's JSON stdout is ephemeral). After step 6's merge, write the merged findings to `~/.claude/cycle-review/runs/<PR>-round<N>.json` where `<PR>` is the PR number and `<N>` is the current cycle number (1/2/3 — same counter the step-4 finalize gate tracks). Build it with `jq -n` so the JSON is always well-formed; one object per round:
+   ```json
+   {
+     "pr": <PR>, "round": <N>, "timestamp": "<ISO 8601 from date -u +%Y-%m-%dT%H:%M:%SZ>",
+     "findings": [
+       {"reviewer": "claude", "path": "<path>", "line": <int>, "title": "<title>", "claim": "<claim>", "severity": "minor"},
+       {"reviewer": "codex",  "path": "<path>", "line": <int>, "title": "<title>", "claim": "<claim>", "severity": "<critical|minor>"}
+     ]
+   }
+   ```
+   `mkdir -p ~/.claude/cycle-review/runs/` (it's next to `config.json` from step 0). Tag every finding with its `reviewer` (`claude` for `/review`, `codex` for Codex) so step 6.5 and the step-4b summary can attribute. Do NOT clean these files up at the end of the run — they are how step 6.5 reconstructs prior rounds; if a re-run repeats a round number, overwrite that file in place (the latest triage of round N wins).
 
 These merged findings are the local equivalent of "reviewer comments" — carry them straight into step 4's triage. Step 4 still assigns the `FIX`/`SKIP`/… verdicts and is the single place merge-readiness is decided; it re-verifies every claim there. Codex's findings are **not** exempt from claim-verification — treat a Codex `claim` exactly like a bot comment that may hallucinate. Skip step 3 entirely in local mode and go to step 4.
 
-For thorough or explicitly adversarial reviews you may still spawn more than one Claude subagent with different lenses (correctness / security / does-it-implement-the-issue) and merge their findings alongside Codex's before triage — optional, scale to the request.
+`/review` is a read-only single-pass review (NOT the multi-agent, confidence-scored `/code-review` skill — a different command). Do not add extra Claude review subagents on top of it: rely on `/review`'s parsed findings plus Codex's. Only if the user explicitly asks for an extra adversarial pass would you spawn additional review subagents and merge their findings alongside `/review`'s and Codex's before triage — optional, scale to the request.
 
 ### 3. Wait for reviewer response — **cloud mode only**
 
-Local mode has nothing to wait for (the subagent in step 2b already returned its findings synchronously) — skip this step and go to step 4.
+Local mode has no GitHub bot to wait for, and `/review` is synchronous (its assistant message lands as soon as the `Skill` call returns — there is nothing to poll). The only asynchronous bit — the backgrounded Codex run — is already collected in step 2b.3. So by the time you reach step 3, `/review`'s message has been parsed and Codex (if configured) has reported. Skip step 3 and go to step 4.
 
 #### 3a. Cloud wait
 
@@ -300,7 +311,7 @@ re-run the same command; a fresh wait is harmless.
 
 **Comment source depends on the mode (step 0.1):**
 - **Cloud** — the reviewer comments fetched from GitHub (the three surfaces below).
-- **Local** — the **merged** findings (Claude subagent + Codex when `@codex` is configured) returned in step 2b. They are already claim-checked, but triage is still where each gets a `FIX`/`SKIP`/… verdict and where merge-readiness is decided. Treat each finding exactly like a reviewer comment (its `path`/`line` map to a comment's `path`/`line`). Codex findings carry `reviewer: codex` and are claim-verified here exactly like bot comments — do not trust Codex's `claim` at face value. You do not re-fetch GitHub comments to obtain the findings, though a human may also have left comments — read those too if present.
+- **Local** — the **merged** findings (`/review` + Codex when `@codex` is configured) produced in step 2b. `/review`'s findings are the issues you read out of its review (free-form prose — no fixed format; you extract them by judgment, like any reviewer comment); Codex findings from its JSON. Triage is still where each gets a `FIX`/`SKIP`/… verdict and where merge-readiness is decided. Treat each finding exactly like a reviewer comment. Codex findings carry `reviewer: codex` and are claim-verified here exactly like bot comments — do not trust Codex's `claim` at face value. `/review` is a single-pass review with NO upstream confidence filtering, so verify each `/review` claim here just as rigorously (LLM reviews hallucinate: non-existent functions, wrong line numbers). You do not re-fetch GitHub comments to obtain the findings, though a human may also have left comments — read those too if present.
 
 #### 4a. Fetch comments (cloud mode)
 
@@ -319,7 +330,7 @@ Process comments from **all three surfaces** and from every reviewer, not just `
 
 #### 4b. Triage (both modes)
 
-Launch a subagent (Agent tool) to triage each comment (cloud) or each subagent finding (local). The subagent must:
+Launch a **triage** subagent (Agent tool — this is the triage engine, distinct from any review subagent) to triage each comment (cloud) or each finding (local, from `/review` + Codex). The subagent must:
 - Read the current code of files referenced in the comments
 - Check whether the issue was already fixed in previous commits (compare with what the reviewer is requesting)
 - Assess severity: critical (bug, security, logical error) vs cosmetic (style, naming, formatting)
@@ -339,7 +350,7 @@ In **cloud** mode those replies attach to the bot's existing comments. In **loca
 ```bash
 gh pr comment <PR> --body "$(cat <<'EOF'
 ## 🔍 Local review (cycle N)
-Reviewed locally (Claude subagent + Codex companion), no bots pinged.
+Reviewed locally (`/review` + Codex companion), no bots pinged.
 
 | Verdict | Reviewer | Finding | Location |
 |---|---|---|---|
@@ -351,10 +362,10 @@ EOF
 ```
 Run via `Bash` with `dangerouslyDisableSandbox: true`. This is the comment the user asked local mode to record before fixing — write it every round, then proceed to fix the `FIX` items.
 
-**Decide whether to finalize** — check these in order (the first two gates are **cloud-only** — they guard against bot silence/outage, which can't happen in local mode where the subagent returns synchronously):
+**Decide whether to finalize** — check these in order (the first two gates are **cloud-only** — they guard against bot silence/outage, which can't happen in local mode where the reviewers report directly):
 - **(cloud only) Step 3 returned `ERROR`** → do NOT finalize. The comments could not be read (a sustained API outage), so an empty triage is meaningless, not approval. Notify the user and stop; never let an outage become a silent merge.
-- **(cloud only) No reviewer was actually heard from this round** → do NOT finalize. If the configured bots posted nothing new for this round (the bots were slow, or Claude shows a usage-limit message instead of a review and no other reviewer responded), then no review happened — "no `FIX` verdicts" only reflects silence, not an approval. Treat a Claude usage-limit message as "Claude did not review" (not a finding). If Codex is configured and reviewed, you may proceed on Codex alone; if nobody reviewed, notify the user and stop. This must be checked BEFORE interpreting the absence of `FIX` verdicts. (In local mode the subagent always returns a review, so this gate is satisfied by construction.)
-- **No `FIX` verdicts**, and a real review happened (cloud: at least one reviewer reviewed; local: the subagent returned) → this is the **final cycle**. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal. Post the replies/summary above for any non-`FIX` comments, then go to **step 6.5** (final cleanup pass — apply the accumulated minor findings). After 6.5: **cloud** proceeds to CI (step 7) + merge (step 8); **local** stops and reports — it does NOT run step 7/8 or merge on its own (see step 8).
+- **(cloud only) No reviewer was actually heard from this round** → do NOT finalize. If the configured bots posted nothing new for this round (the bots were slow, or Claude shows a usage-limit message instead of a review and no other reviewer responded), then no review happened — "no `FIX` verdicts" only reflects silence, not an approval. Treat a Claude usage-limit message as "Claude did not review" (not a finding). If Codex is configured and reviewed, you may proceed on Codex alone; if nobody reviewed, notify the user and stop. This must be checked BEFORE interpreting the absence of `FIX` verdicts. (In local mode the equivalent is step 2b's `/review` fail-closed: if the `Skill` call errored or `/review` produced no review at all, no Claude review happened — stop; if Codex is configured and reviewed, you may proceed on Codex alone.)
+- **No `FIX` verdicts**, and a real review happened (cloud: at least one reviewer reviewed; local: `/review` posted its comment and/or Codex reviewed) → this is the **final cycle**. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal. Post the replies/summary above for any non-`FIX` comments, then go to **step 6.5** (final cleanup pass — apply the accumulated minor findings). After 6.5: **cloud** proceeds to CI (step 7) + merge (step 8); **local** stops and reports — it does NOT run step 7/8 or merge on its own (see step 8).
 - **At least one `FIX`, and this is the 3rd cycle** → STOP, do not start a 4th. Three full review rounds with findings still outstanding means the PR isn't converging on its own — looping further wastes review budget. Notify the user: summarize the still-open `FIX` findings and propose narrowing scope — e.g. move some findings **out of scope** into a follow-up issue/PR so the core change can merge, or have the user rethink the approach. Wait for the user's decision; do not merge and do not auto-loop. (Count a "cycle" as one completed round of steps 2–6, i.e. one review request + triage. The round that produced this 3rd batch of `FIX`s is the 3rd.)
 - **At least one `FIX`, and this is cycle 1 or 2** → proceed to step 5.
 
@@ -370,13 +381,13 @@ The cycle counter lives only in your working memory across a long conversation, 
 ### 6. Commit and push
 - Commit fixes with a meaningful message (conventional commits style)
 - Push to remote
-- Return to step 2 ONLY if fewer than 3 cycles have run. This begins a **new review round**: **cloud** posts a fresh review request and runs the step-3 waiter again (it always waits a clean fixed window — nothing to reset); **local** re-spawns the review subagent (step 2b) against the now-updated diff, no wait. Keep a running count of completed cycles (one cycle = one steps 2–6 round). **Hard cap: 3 cycles.** If the round you just triaged was the 3rd and it still had `FIX` verdicts, do NOT loop again — stop and hand back to the user per the step-4 "3rd cycle" gate (summarize the open findings, propose moving some out of scope into a follow-up issue/PR, or rethinking the approach). The cap only bites when findings persist; a clean 1st or 2nd round finalizes normally.
+- Return to step 2 ONLY if fewer than 3 cycles have run. This begins a **new review round**: **cloud** posts a fresh review request and runs the step-3 waiter again (it always waits a clean fixed window — nothing to reset); **local** re-runs `/review` (step 2b) against the now-updated diff, plus Codex if configured. Keep a running count of completed cycles (one cycle = one steps 2–6 round). **Hard cap: 3 cycles.** If the round you just triaged was the 3rd and it still had `FIX` verdicts, do NOT loop again — stop and hand back to the user per the step-4 "3rd cycle" gate (summarize the open findings, propose moving some out of scope into a follow-up issue/PR, or rethinking the approach). The cap only bites when findings persist; a clean 1st or 2nd round finalizes normally.
 
 ### 6.5. Final cleanup pass (last cycle — apply the accumulated minor findings)
 
 Reached only on the **final cycle** — when a round has no `FIX` verdicts (step 4) and a real review happened. This is the last cycle: there will be **no further review round** after it. Before finalizing, spend this one pass cleaning up everything that was correct-but-not-blocking and was therefore deferred across the earlier rounds, so nothing useful is left on the table.
 
-1. **Gather the minor findings from EVERY previous review round, not just the last one.** Re-read all findings across the whole PR history — **cloud**: all three GitHub surfaces (issue comments, PR reviews, inline review comments — same fetch as step 4); **local**: the subagent findings from every round (and any human comments on the PR). Collect every finding that is real and actionable but was not a `FIX`:
+1. **Gather the minor findings from EVERY previous review round, not just the last one.** Re-read all findings across the whole PR history — **cloud**: all three GitHub surfaces (issue comments, PR reviews, inline review comments — same fetch as step 4); **local**: read each prior round's **per-run findings file** written in step 2b.7 (each round's merged `/review` + Codex findings persisted at `~/.claude/cycle-review/runs/<PR>-round<N>.json`), plus any human comments on the PR. Do NOT try to re-fetch `/review`'s output from GitHub — it never posted a PR comment — and do NOT look for a "recorded Codex JSON": the only persistence of either is the per-run file written in step 2b.7. Collect every finding that is real and actionable but was not a `FIX`:
    - all `SKIP` (genuine cosmetic/style/naming/minor-improvement findings), and
    - any reasonable nice-to-have the reviewers suggested (e.g. "add a clarifying comment", "rename for clarity", "tidy this helper", "add a migration note") — even when previously deferred as non-blocking.
 
@@ -430,7 +441,7 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - return to step 2 with the next PR.
 
 ## Important
-- **Two modes (step 0.1).** `cloud` (default) pings GitHub bots and runs autonomously through merge; `local` reviews with an in-process Claude subagent (no bot ping, no GitHub wait) and is **review-only on merge** — it loops triage→reply/summary→fix→commit→push but stops after cleanup and never merges on its own. A leading `local`/`cloud` flag overrides the saved `mode`; with neither, default to cloud. In local mode the Claude subagent always runs; if `@codex` is in the reviewers list, Codex also reviews locally (companion script, in parallel, findings merged) — and if `@codex` is configured but Codex is unavailable, local mode STOPS and asks you to log in (fail-closed), it does not fall back to Claude alone.
+- **Two modes (step 0.1).** `cloud` (default) pings GitHub bots and runs autonomously through merge; `local` reviews with the built-in `/review` command (no bot ping, no GitHub wait) and is **review-only on merge** — it loops triage→reply/summary→fix→commit→push but stops after cleanup and never merges on its own. A leading `local`/`cloud` flag overrides the saved `mode`; with neither, default to cloud. In local mode `/review` always runs; if `@codex` is in the reviewers list, Codex also reviews locally (companion script, in parallel, findings merged) — and if `@codex` is configured but Codex is unavailable, local mode STOPS and asks you to log in (fail-closed), it does not fall back to `/review` alone.
 - **Local review records its verdicts on the PR.** Because there is no bot comment to reply to, local mode posts one triage-summary comment per round before fixing (step 4), so the PR has a durable record of what the local reviewer found.
 - **Verify completeness before review (step 1.5).** For every PR with a linked issue, confirm the PR implements the issue's design 100% BEFORE requesting a review. Bots check code correctness, not completeness against the issue — they will happily approve a PR that ships only half the design. Read the issue, turn its design into a checklist, verify each item in the diff, and close any gap (test-first) before step 2. Never start the review loop on a half-finished issue.
 - **Final cleanup pass before merge (step 6.5).** The round with no `FIX` verdicts is the LAST cycle — there is no review round after it. On that pass, apply ALL the accumulated minor findings (every genuine `SKIP` plus any reasonable nice-to-have suggestion) gathered from **every previous review round**, not just the last one — they were deferred with a reply during the loop, but the final pass actually fixes them. Exclude only `HALLUCINATION` / `IRRELEVANT` / `CONFLICTING` / `ALREADY_FIXED` (nothing to fix there). Lint + test + commit the cleanup, then go straight to CI + merge — do NOT request another review for it.
@@ -444,4 +455,4 @@ If a multi-PR queue was built in step 1 and PRs remain:
 - Run lint and tests before every commit
 - If tests fail after fixes — fix them before pushing
 - Never merge without a real review. Finalize only if at least one configured reviewer actually posted a review this round (see the finalize gate in step 4). If the bots stayed silent, or Claude only showed a usage-limit message and no one else reviewed, or step 3 returned `ERROR` (a sustained API outage) — notify the user and stop. An empty triage from silence or an outage is not an approval.
-- In local mode, if `@codex` is configured but its companion is missing or not logged in, treat it like an unreachable reviewer — stop and ask the user to log in (`codex login`), never proceed on the Claude subagent silently (fail-closed, step 2b.4).
+- In local mode, if `@codex` is configured but its companion is missing or not logged in, treat it like an unreachable reviewer — stop and ask the user to log in (`codex login`), never proceed on `/review` alone silently (fail-closed, step 2b.4). If `/review` itself produces no comment (timed out), that is also fail-closed — no review happened, do not finalize.
