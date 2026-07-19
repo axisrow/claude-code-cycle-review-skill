@@ -549,9 +549,35 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
    ```bash
    rm -f "$STATE_FILE" "$STATE_FILE.tmp"   # before the first cleanup edit, if anything will be changed/pushed
    ```
-   If the pass is a genuine no-op (nothing to apply, nothing pushed), retain the record and proceed. Then: **cloud** proceeds to step 10 (CI) + step 11 (merge) on the retained record; **local** stops and reports (no auto-merge). Report to the user the summary of what was fixed across rounds (+ cleanup `<sha>`), and that merge is theirs to trigger.
+   If the pass is a genuine no-op (nothing to apply, nothing pushed), retain the record and proceed. Then: **cloud** proceeds to step 10 (CI) + step 11 (merge) on the retained record; **local** stops and reports (no auto-merge).
 
 If, after re-reading every round, there are genuinely no minor findings to apply (a clean PR that never accrued any `SKIP`/nice-to-have), this step is a no-op — cloud proceeds to step 10; local proceeds to its stop-and-report.
+
+**Post a final review-summary table on the PR** (both modes). Accumulate from **every** prior review round — include findings from **both** reviewers (claude `/review` AND Codex companion, plus any human comments). This is the roll-up of the entire review history: what was caught, what was fixed (and in which commit), what was deliberately skipped, and what was UNVERIFIED.
+
+**Build the comment body without any shell interpolation of review content.** Review titles are untrusted text (especially in cloud mode). Never place them inside double-quoted shell arguments, heredocs, or `$(...)` — `$(cmd)`, backticks, and newlines in a title all execute or break the shell. Instead, construct the full comment body as a JSON string using `jq -n` (which treats `--arg` values as literal data, no shell expansion), then pass it via `gh pr comment --body`:
+
+```bash
+TMPFILE=$(mktemp)
+jq -n --arg body "$(cat <<'SKILLEOF'
+## 📋 Review summary — all cycles
+
+| Cycle | Reviewer | Finding | Verdict | Resolution |
+|---|---|---|---|---|
+| 1 | codex | <title> | FIX | Fixed in <sha> |
+| 1 | claude | <title> | SKIP | Left as-is |
+| ... | ... | ... | ... | ... |
+
+**Totals:** <N> FIX (all resolved), <N> SKIP, <N> UNVERIFIED.
+SKILLEOF
+)" '{body: $body}' > "$TMPFILE"
+gh pr comment <PR> --body "$(jq -r '.body' "$TMPFILE")"   # Bash, dangerouslyDisableSandbox: true
+rm -f "$TMPFILE"
+```
+
+**Important:** The agent fills in the `<title>`, `<sha>`, and `<N>` placeholders by **typing the literal table text** — not by shell-interpolating variables. If building programmatically, pass every review-title through `jq --arg` (never through shell double-quotes or heredocs). Truncate titles to ~80 chars and strip newlines/pipes for markdown-table safety.
+
+This table is informational — it does not affect merge decisions. After posting it: **cloud** proceeds to step 10; **local** reports to the user that the review cycle is complete (+ cleanup `<sha>` if any), and that merge is theirs to trigger.
 
 ### 10. Check CI before merge — **cloud mode only**
 
