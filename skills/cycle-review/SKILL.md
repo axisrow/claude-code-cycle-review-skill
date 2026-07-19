@@ -194,6 +194,13 @@ Run this **once per PR, before step 4** — do NOT ask the bots to review a half
 
 ### 4. Request review
 
+**Bind this review round to one PR-head SHA.** Before requesting or running any reviewer, capture the full head OID — all review collection, static verification, scratch-worktree reproduction, and triage in this round apply **only** to this SHA:
+```bash
+ROUND_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)   # Bash, dangerouslyDisableSandbox: true
+test -n "$ROUND_SHA" || { echo "Could not resolve PR head SHA; stop."; exit 1; }
+```
+Create any scratch worktree at exactly `ROUND_SHA`; do not resolve a newer SHA per-finding.
+
 **Branch on the active mode (step 1).**
 
 **Cloud:** ping the configured bots. **Local:** run the built-in `/review` (plus Codex when `@codex` is configured). In both modes, launch everything that runs in parallel up front, then step 5 waits (cloud) or step 6 collects (local).
@@ -374,8 +381,26 @@ Launch a **triage** subagent (Agent tool — this is the triage engine, distinct
 - Assess severity: critical (bug, security, logical error) vs cosmetic (style, naming, formatting)
 - Check relevance: does the comment actually relate to this PR's code? The reviewer may be mistaken — referencing non-existent files, confusing function names, or providing feedback that clearly belongs to a different project/PR. Mark such comments as `IRRELEVANT`
 - Check consistency: does the comment contradict previous comments from the same or another reviewer? If the reviewer asks for X now but asked for not-X in the previous cycle — mark as `CONFLICTING`
-- **Verify every claim before assigning `FIX`**: for each comment, read the actual files and grep the codebase to confirm that every statement the reviewer makes is true. Do not take any claim at face value — LLM reviewers routinely hallucinate: non-existent functions, wrong line numbers, incorrect patterns, false project-wide conventions (e.g. "only English comments", "this method doesn't exist", "this pattern is used everywhere"). A `FIX` verdict is only valid when the underlying claim is confirmed by reading the actual code. If any claim is false — mark as `HALLUCINATION`
-- Return a list of comments with a verdict: `FIX` (needs fixing), `ALREADY_FIXED` (already resolved), `SKIP` (cosmetic), `IRRELEVANT` (unrelated to this PR), `CONFLICTING` (contradicts previous comments), `HALLUCINATION` (reviewer's factual claim about the codebase is verifiably false)
+- **Verify every claim before assigning `FIX`** — and pick the verification tool that matches the claim's type. Triage behavior is unchanged from before (every finding is still verified); this just adds a TDD/mutation tool for the cases where grep alone can't decide. Decompose each finding into:
+  - **FACTUAL premises** (state of the repo: "function doesn't exist", "operator is `==`", "import missing", "line N is X") — decidable from Read/Grep/static tooling. Confirm or refute by reading the code. A true factual premise is **not by itself a defect** — also identify the violated contract/invariant/reachable impact. If a material factual claim is demonstrably false → `HALLUCINATION`.
+  - **BEHAVIORAL conclusions** (runtime: "crashes on empty input", "race under X", "off-by-one at boundary", "returns wrong value for Y") — grep confirms the code *looks* that way but does **not** prove it's a bug. Requires a stated **oracle** (spec, invariant, compatibility contract, established behavior) **plus** runtime evidence. Apply the TDD evidence gate below.
+- **Executable evidence gate for BEHAVIORAL claims — conservative execution, not isolation.** A prompt-only skill is **not** a security boundary. A scratch worktree separates files and pins a revision; it does **not** sandbox execution. An allowlisted command name does not make execution safe either — `pytest` may load PR-controlled `conftest.py` and plugins, and repo test runners / build files / package hooks / config may execute arbitrary PR-controlled code.
+  - **Before executing any reproducer, make an explicit trust decision.** Treat every repo test command as arbitrary code execution from the PR. Run it only when **all** of these are true:
+    1. The repository and PR provenance are **affirmatively trusted** — e.g. the PR author is you (`@me`), a known collaborator, or otherwise trusted. "No obvious malicious code" is **not** sufficient.
+    2. Executing arbitrary code from the pinned PR SHA with the current process's ambient filesystem, credentials, and network access would be acceptable.
+    3. The PR contains **no** suspicious or unexpected changes to test bootstraps, `conftest.py`, test plugins, runner scripts, build/package hooks, dependency-install paths, or command config.
+    4. The reproducer uses only the repo's already-established, allowlisted test command. It requires **no** dependency install, bootstrap script, arbitrary PR-supplied script, elevated privilege, secret, external service, or destructive operation.
+    5. Safety does not depend on a filesystem/credential/network/process restriction that this prompt cannot enforce. If a real sandbox would be required to make execution acceptable, do **not** execute.
+  - If any condition is false or uncertain → **do not run the reproducer**. Assign **`UNVERIFIED`**, record which trust/execution condition prevented runtime verification, and let the existing `UNVERIFIED` gate stop finalization. **Never** downgrade "can't execute safely" into `HALLUCINATION`.
+  - If execution is permitted: use the scratch worktree only for revision pinning and working-tree separation (create it at the round's `ROUND_SHA` from step 4 — see below). Run **exactly** the allowlisted test command against that pinned SHA, record command + SHA + oracle + result, and clean up the worktree after. Do **not** describe the execution as isolated or sandboxed unless the runtime independently enforces such a boundary.
+  - Outcomes:
+    - A **deterministic red** result against a valid oracle → supports `FIX` (carry the test patch into step 7).
+    - A result **positively disproving** the complete claim → `HALLUCINATION`.
+    - An **inconclusive** result, an unsafe execution decision, a missing environment, or a missing deterministic test seam → `UNVERIFIED`.
+    - A red test **alone is not proof** of a bug — require both the failing behavior and a violated spec/invariant/compatibility-contract/established-behavior before `FIX`.
+  - **When executable evidence doesn't apply** (textual/docs/style/naming/architecture findings with no executable acceptance criterion, a repo with no test framework, or an untrusted PR where the trust conditions above fail) — fall back to factual/static verification; do not force an execution.
+  - The skill does not configure, emulate, or redesign runtime sandboxing — real isolation belongs to the runtime (per the vendor-mechanic principle in `## Important`). This gate decides only whether executing PR-controlled code is acceptable; otherwise it fails closed as `UNVERIFIED`.
+- Return a list of comments with a verdict: `FIX` (needs fixing), `ALREADY_FIXED` (already resolved), `SKIP` (cosmetic), `IRRELEVANT` (unrelated to this PR), `CONFLICTING` (contradicts previous comments), `HALLUCINATION` (a material claim is demonstrably false), `UNVERIFIED` (claim could not be confirmed or refuted with the evidence the cycle can produce — needs a reproducer/environment it doesn't have)
 
 Triage is still where each gets a `FIX`/`SKIP`/… verdict and where merge-readiness is decided. Treat each finding exactly like a reviewer comment. Codex findings carry `reviewer: codex` and are claim-verified here exactly like bot comments — do not trust Codex's `claim` at face value. `/review` is a single-pass review with NO upstream confidence filtering, so verify each `/review` claim here just as rigorously (LLM reviews hallucinate: non-existent functions, wrong line numbers).
 
@@ -385,6 +410,7 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 - `IRRELEVANT` — politely note that the comment does not relate to this PR's code
 - `CONFLICTING` — quote the contradicting previous comment and ask the reviewer to clarify
 - `HALLUCINATION` — show concrete evidence from the codebase (grep results, file contents) that disproves the reviewer's claim
+- `UNVERIFIED` — a behavioral claim that couldn't be confirmed or refuted with the evidence the cycle can produce (no deterministic test seam, missing environment/deps). State what reproducer/environment is missing and that the cycle stopped because of it — do **not** treat it as approved.
 
 In **cloud** mode those replies attach to the bot's existing comments. In **local** mode the findings have no GitHub comment to reply to, so instead **post one summary comment** on the PR recording this round's triage results — the local review is the reviewer of record, so its verdicts must land on the PR. When Codex also ran, attribute each finding to its source (the `Reviewer` column); when `@codex` was not configured, drop that column and the heading's "+ Codex companion":
 ```bash
@@ -404,10 +430,22 @@ Run via `Bash` with `dangerouslyDisableSandbox: true`. This is the comment the u
 
 #### Decide whether to finalize
 
+**Bind the round to the verified SHA first.** Immediately before declaring the round clean, compare the current PR head with `ROUND_SHA`. If they differ, the whole round is stale — discard the merge-readiness result and restart step 4 against the new head (or stop and report the drift). Only if they match does `ROUND_SHA` become `VERIFIED_SHA`, persisted outside the reviewed repo:
+```bash
+CURRENT_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)   # Bash, dangerouslyDisableSandbox: true
+[ "$CURRENT_SHA" = "$ROUND_SHA" ] || { echo "PR head changed during review: reviewed $ROUND_SHA, current $CURRENT_SHA — restart step 4."; exit 1; }
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+STATE_DIR="$HOME/.claude/cycle-review/runs/$REPO_NWO"; STATE_FILE="$STATE_DIR/$PR-verified.json"
+mkdir -p "$STATE_DIR"
+jq -n --argjson pr <PR> --arg sha "$ROUND_SHA" '{pr: $pr, verified_head_sha: $sha}' > "$STATE_FILE"
+```
+Step 11's merge consumes `VERIFIED_SHA` and refuses to merge any other head.
+
 Check these in order (the first two gates are **cloud-only** — they guard against bot silence/outage, which can't happen in local mode where the reviewers report directly):
 - **(cloud only) Step 5 returned `ERROR`** → do NOT finalize. The comments could not be read (a sustained API outage), so an empty triage is meaningless, not approval. Notify the user and stop; never let an outage become a silent merge.
 - **(cloud only) No reviewer was actually heard from this round** → do NOT finalize. If the configured bots posted nothing new for this round (the bots were slow, or Claude shows a usage-limit message instead of a review and no other reviewer responded), then no review happened — "no `FIX` verdicts" only reflects silence, not an approval. Treat a Claude usage-limit message as "Claude did not review" (not a finding). If Codex is configured and reviewed, you may proceed on Codex alone; if nobody reviewed, notify the user and stop. This must be checked BEFORE interpreting the absence of `FIX` verdicts. (In local mode the equivalent is step 4's `/review` fail-closed: if the `Skill` call errored or `/review` produced no review at all, no Claude review happened — stop; if Codex is configured and reviewed, you may proceed on Codex alone.)
-- **No `FIX` verdicts**, and a real review happened (cloud: at least one reviewer reviewed; local: `/review` produced a review and/or Codex reviewed) → this is the **final cycle**. Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal. Post the replies/summary above for any non-`FIX` comments, then go to **step 9** (final cleanup pass — apply the accumulated minor findings). After step 9: **cloud** proceeds to CI (step 10) + merge (step 11); **local** stops and reports — it does NOT run step 10/11 or merge on its own (see step 11).
+- **No `FIX` and no `UNVERIFIED` verdicts**, and a real review happened (cloud: at least one reviewer reviewed; local: `/review` produced a review and/or Codex reviewed) → this is the **final cycle**. (`UNVERIFIED` blocks finalization just like `FIX` — a behavioral claim we couldn't confirm or refute is not approval.) Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal. Post the replies/summary above for any non-`FIX` comments, then go to **step 9** (final cleanup pass — apply the accumulated minor findings). After step 9: **cloud** proceeds to CI (step 10) + merge (step 11); **local** stops and reports — it does NOT run step 10/11 or merge on its own (see step 11).
+- **Any `UNVERIFIED` verdict** → do NOT finalize. The cycle cannot prove or disprove the claim with the evidence it can produce. STOP, report the `UNVERIFIED` finding(s) and what reproducer/environment is missing, and hand back to the user — never let an unresolved behavioral claim look like approval. (This is the additive safety gate: "couldn't reproduce" must not silently clear the PR.)
 - **At least one `FIX`, and this is the 3rd cycle** → STOP, do not start a 4th. Three full review rounds with findings still outstanding means the PR isn't converging on its own — looping further wastes review budget. Notify the user: summarize the still-open `FIX` findings and propose narrowing scope — e.g. move some findings **out of scope** into a follow-up issue/PR so the core change can merge, or have the user rethink the approach. Wait for the user's decision; do not merge and do not auto-loop. (Count a "cycle" as one completed round of steps 4–8, i.e. one review request + triage. The round that produced this 3rd batch of `FIX`s is the 3rd.)
 - **At least one `FIX`, and this is cycle 1 or 2** → proceed to step 7.
 
@@ -419,7 +457,7 @@ Only fix comments with the `FIX` verdict from step 6 — and fix them **properly
 
 For **each** `FIX` verdict, in turn:
 
-1. **Reproduce it first (test-first).** Before touching production code, write a test that **fails** because of the bug — the test must encode the reviewer's claim (read the file/line, confirm the claim in step 6 already verified it's real) and turn red on the current code. Run it and confirm it fails **for the right reason** (the bug), not for a setup/import error. If the repo has no test framework or the bug genuinely can't be reproduced by a test (e.g. a doc-only issue, an architectural concern, a cross-process/race bug with no test seam) — note that explicitly and fall through to the direct fix below, but do not skip the test by default.
+1. **Reproduce it first (test-first).** If step 6 already produced a confirmed reproducing test for this `FIX` (behavioral claim, reproduced in the scratch worktree), **use it** — re-apply it to the production tree and confirm it still fails for the right reason; don't rewrite it. Otherwise write a test that **fails** because of the bug — the test must encode the reviewer's claim (read the file/line, confirm the claim in step 6 already verified it's real) and turn red on the current code. Run it and confirm it fails **for the right reason** (the bug), not for a setup/import error. If the repo has no test framework or the bug genuinely can't be reproduced by a test (e.g. a doc-only issue, an architectural concern, a cross-process/race bug with no test seam) — note that explicitly and fall through to the direct fix below, but do not skip the test by default.
 2. **Minimal fix.** Make the smallest change that turns the red test green. No refactors, no "while I'm here" edits, no scope creep — the diff must address the bug and nothing else. (Cosmetic/nice-to-have items are `SKIP`s, handled in step 9, not here.)
 3. **Green.** Run the new test plus the **full** suite. The new test passes; nothing else regressed. If a pre-existing test now fails, that's a signal the fix is wrong or too broad — narrow it, don't loosen the test.
 4. **Mutation check.** Revert the fix mentally / tweak it: would the test still pass if the fix were subtly wrong (off-by-one, wrong condition, fixed the symptom not the cause)? If yes, strengthen the test until a wrong fix would fail it. The test must actually guard the bug, not just happen to pass.
@@ -443,7 +481,7 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
    - all `SKIP` (genuine cosmetic/style/naming/minor-improvement findings), and
    - any reasonable nice-to-have the reviewers suggested (e.g. "add a clarifying comment", "rename for clarity", "tidy this helper", "add a migration note") — even when previously deferred as non-blocking.
 
-   Explicitly EXCLUDE the verdicts that have nothing to fix: `HALLUCINATION` (claim is false), `IRRELEVANT` (not this PR's code), `CONFLICTING` (contradictory — ask, don't guess), and `ALREADY_FIXED` (already done). De-dup findings that recurred across rounds by their substance (use `path` + `line` when present, as on Codex inline comments; otherwise the gist of the body — Claude's single issue comment has no path/line), and skip any that a later commit already addressed.
+   Explicitly EXCLUDE the verdicts that have nothing to fix: `HALLUCINATION` (claim is false), `IRRELEVANT` (not this PR's code), `CONFLICTING` (contradictory — ask, don't guess), `ALREADY_FIXED` (already done), and `UNVERIFIED` (unresolved — not deferred-cosmetic; it blocked the cycle, it's not a cleanup item). De-dup findings that recurred across rounds by their substance (use `path` + `line` when present, as on Codex inline comments; otherwise the gist of the body — Claude's single issue comment has no path/line), and skip any that a later commit already addressed.
 
 2. **Apply all of them.** Make the edits, keeping each change minimal and faithful to the reviewer's intent. If a suggested change would be risky, change behavior, or contradicts the repo's conventions, do NOT force it — leave a short reply explaining why it was left out (this is the only thing that may remain unfixed).
 
@@ -451,7 +489,11 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
 
 4. **Commit and push** (conventional-commits style, e.g. `chore: apply non-blocking review nitpicks before merge`). On the PR, briefly note that the deferred minor findings were applied in `<sha>`.
 
-5. **Do NOT return to step 4.** This pass does not request another review. **Cloud** proceeds directly to step 10 (CI) and step 11 (merge) — the cleanup commit rides the same CI run. **Local** stops here: it does not run step 10/11 and does not merge. Report to the user that the review cycle is complete (summary of what was fixed across rounds and the cleanup `<sha>`), and that merge is theirs to trigger.
+5. **A cleanup commit invalidates the verified SHA.** If this pass changes or pushes any file, the PR head has moved off `VERIFIED_SHA` — the clean verdict no longer binds to the new head. Remove the verified-SHA state and **return to step 4** for a fresh clean review of the new head (do **not** proceed straight to CI/merge on a post-review commit). If the pass is a genuine no-op (nothing to apply, nothing pushed), retain `VERIFIED_SHA` and proceed:
+   ```bash
+   rm -f "$STATE_FILE"   # only when this pass pushed a commit
+   ```
+   Then: **cloud** proceeds to step 10 (CI) + step 11 (merge) on the retained `VERIFIED_SHA`; **local** stops and reports (no auto-merge). Report to the user the summary of what was fixed across rounds (+ cleanup `<sha>`), and that merge is theirs to trigger.
 
 If, after re-reading every round, there are genuinely no minor findings to apply (a clean PR that never accrued any `SKIP`/nice-to-have), this step is a no-op — cloud proceeds to step 10; local proceeds to its stop-and-report.
 
@@ -478,12 +520,20 @@ If the same CI check fails more than 2 times after fixes — notify the user and
 
 **Local mode does not merge.** It is review-only on merge by design (the user triggers merge explicitly). After step 9 in local mode, stop and report — do not run the commands below.
 
-Cloud mode: when the PR has no remaining `FIX` verdicts and CI is green:
+Cloud mode: when the PR has no remaining `FIX` verdicts and CI is green, merge **only the verified head**. Load `VERIFIED_SHA` from the state file, re-check the current head matches it, then merge with GitHub CLI's atomic expected-head guard (`--match-head-commit`). If the head drifted since verification, stop and restart review — do **not** merge the substituted commit, and do **not** retry without the guard:
 ```bash
-gh pr merge <PR> --squash --delete-branch
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+STATE_FILE="$HOME/.claude/cycle-review/runs/$REPO_NWO/$PR-verified.json"
+VERIFIED_SHA=$(jq -er --argjson pr <PR> 'select(.pr == <PR>) | .verified_head_sha' "$STATE_FILE") \
+  || { echo "No verified PR-head SHA recorded; stop without merging."; exit 1; }
+CURRENT_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)
+[ "$CURRENT_SHA" = "$VERIFIED_SHA" ] || { echo "PR head drifted: verified $VERIFIED_SHA, current $CURRENT_SHA. Restart review."; exit 1; }
+gh pr merge <PR> --squash --delete-branch --match-head-commit "$VERIFIED_SHA"
 git checkout main
 git pull
+rm -f "$STATE_FILE"
 ```
+If the installed `gh` lacks `--match-head-commit` (`gh pr merge --help` doesn't list it), **stop** — do not fall back to a plain compare-then-merge (that leaves the check-to-merge TOCTOU hole). Upgrade `gh` or merge manually with an equivalent expected-head guard.
 
 If the user later asks to merge a PR that was reviewed in local mode, this is the step to run (after confirming CI is green via step 10).
 
@@ -493,6 +543,7 @@ If a multi-PR queue was built in step 2 and PRs remain:
 - return to step 4 with the next PR.
 
 ## Important
+- **Built-in review mechanics are vendor-supported — don't redesign them.** Claude Code's built-in `/review` and the codex companion's `review`/`adversarial-review` are maintained by their vendors (Anthropic / the codex-fork maintainer). The skill **consumes** their findings and triages them like any reviewer comment — it does **not** alter, override, or re-implement how those reviewers work, what they flag, or how confident they are. If a vendor reviewer's behavior needs changing, that's an upstream issue (e.g. codex-plugin-cc), not a cycle-review change. The TDD/mutation verification in step 6 is *our triage tool*, applied to the findings we receive — never a prescription for how the vendor reviewers should behave.
 - **Two modes (step 1).** `cloud` (default) pings GitHub bots and runs autonomously through merge; `local` reviews with the built-in `/review` command (no bot ping, no GitHub wait) and is **review-only on merge** — it loops triage→reply/summary→fix→commit→push but stops after cleanup and never merges on its own. A leading `local`/`cloud` flag overrides the saved `mode`; with neither, default to cloud. In local mode `/review` always runs; if `@codex` is in the reviewers list, Codex also reviews locally (companion script, in parallel, findings merged) — and if `@codex` is configured but Codex is unavailable, local mode STOPS and asks you to log in (fail-closed), it does not fall back to `/review` alone.
 - **Local review records its verdicts on the PR.** Because there is no bot comment to reply to, local mode posts one triage-summary comment per round before fixing (step 6), so the PR has a durable record of what the local reviewer found.
 - All `gh` commands (and any other GitHub API calls) must be run via Bash with `dangerouslyDisableSandbox: true`, as the sandbox blocks TLS connections to api.github.com.
