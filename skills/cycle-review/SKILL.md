@@ -30,7 +30,7 @@ The skill has **two review modes**. Pick the active one in step 1 before anythin
 
 **Local mode is review-only on merge:** it runs the full triage→reply→fix→commit→push loop, but it **never merges on its own**. It stops after pushing and hands back to the user; merge happens only when the user explicitly asks. Cloud mode keeps the original autonomous merge (step 11).
 
-**Dev mode (codex-fork only):** when the installed codex plugin is the fork (its version segment contains `-fork`), onboarding (step 0) additionally asks for a default **Codex model** and **effort**, stored in config and passed to the companion every round as `--model`/`--effort` (step 4) — so you stop setting them ad-hoc. Per-run override: `--model <v>` / `--effort <v>` in the arguments (step 1). Upstream `codex` ignores both; behavior is unchanged.
+**Dev mode (codex-fork only):** when the installed codex plugin is the fork (the companion path contains a `-fork/` segment, e.g. `.../codex-fork/1.0.6-fork.3/...`), onboarding (step 0) additionally asks for a default **Codex model** and **effort**, stored in config and passed to the companion every round as `--model`/`--effort` (step 4) — so you stop setting them ad-hoc. Per-run override: `--model <v>` / `--effort <v>` in the arguments (step 1). Upstream `codex` (no `-fork/` in the path) ignores both; behavior is unchanged.
 
 ## Cycle
 
@@ -40,7 +40,7 @@ Run step 0 (onboarding) and step 1 (resolve mode) once at the start of every inv
 
 The skill needs two things from the user, stored once: which review bots they have installed (`@claude`, `@codex`, or both — drives cloud mode), and the **default review mode** (`cloud` or `local`). The reviewers list drives who gets pinged in step 4 and whose comments we wait for in step 5 (cloud only). The mode is the default when no `local`/`cloud` flag is passed (step 1).
 
-If a **codex-fork** is the installed codex plugin (the companion path's version segment contains `-fork`, e.g. `.../codex-fork/1.0.6-fork.3/...` — see the detect in step 4), a **dev mode** unlocks two extra onboarding fields: a default **Codex model** and **effort** that are passed to the companion every round so you stop setting them ad-hoc in code. Upstream `codex` (no `-fork` in the version) does not support these flags and the fields stay absent.
+If a **codex-fork** is the installed codex plugin (the companion path contains a `-fork/` segment, e.g. `.../codex-fork/1.0.6-fork.3/...` — see the detect in step 4), a **dev mode** unlocks two extra onboarding fields: a default **Codex model** and **effort** that are passed to the companion every round so you stop setting them ad-hoc in code. Upstream `codex` (no `-fork/` in the path) does not support these flags and the fields stay absent. **Dev-mode fields are written only during onboarding** — an existing v1/v2 config is not auto-upgraded; to enable dev mode on an existing install, re-run `/cycle-review onboard` (the step-0 detect will then offer the model/effort questions).
 
 **Config location (global, per user):** `~/.claude/cycle-review/config.json`. It is intentionally global — not committed into the reviewed repo, set once, reused across all projects.
 
@@ -248,7 +248,7 @@ No bot is pinged and no GitHub wait happens. The **built-in `/review` always run
      ```bash
      BASE=$(gh pr view <PR> --json baseRefName -q .baseRefName)   # Bash, dangerouslyDisableSandbox: true
      ```
-   - **Detect dev mode (codex-fork) from the resolved path**, then build the optional `--model`/`--effort` flags from config + per-run override. Dev mode is on when the companion path's version segment contains `-fork`:
+   - **Detect dev mode (codex-fork) from the resolved path**, then build the optional `--model`/`--effort` flags from config + per-run override. Dev mode is on when the companion path contains a `-fork/` segment:
      ```bash
      CODEX_FORK=false
      case "$COMPANION" in *-fork/*) CODEX_FORK=true;; esac
