@@ -30,6 +30,8 @@ The skill has **two review modes**. Pick the active one in step 1 before anythin
 
 **Local mode is review-only on merge:** it runs the full triage→reply→fix→commit→push loop, but it **never merges on its own**. It stops after pushing and hands back to the user; merge happens only when the user explicitly asks. Cloud mode keeps the original autonomous merge (step 11).
 
+**Dev mode (codex-fork only):** when the installed codex plugin is the fork (its version segment contains `-fork`), onboarding (step 0) additionally asks for a default **Codex model** and **effort**, stored in config and passed to the companion every round as `--model`/`--effort` (step 4) — so you stop setting them ad-hoc. Per-run override: `--model <v>` / `--effort <v>` in the arguments (step 1). Upstream `codex` ignores both; behavior is unchanged.
+
 ## Cycle
 
 Run step 0 (onboarding) and step 1 (resolve mode) once at the start of every invocation. Then, for each PR, run step 3 (verify the PR implements its linked issue 100% — fix any gap BEFORE asking for review), repeat steps 4–8 until the PR has no `FIX` verdicts — **but no more than 3 cycles**; if a 3rd cycle still has `FIX`s, stop and hand back to the user to narrow scope. Once a round is clean, run step 9 (final cleanup pass — apply the minor findings deferred across all earlier rounds). Then: **cloud mode** runs step 10 (CI) and step 11 (merge); **local mode** stops and reports — it does not auto-merge.
@@ -38,6 +40,8 @@ Run step 0 (onboarding) and step 1 (resolve mode) once at the start of every inv
 
 The skill needs two things from the user, stored once: which review bots they have installed (`@claude`, `@codex`, or both — drives cloud mode), and the **default review mode** (`cloud` or `local`). The reviewers list drives who gets pinged in step 4 and whose comments we wait for in step 5 (cloud only). The mode is the default when no `local`/`cloud` flag is passed (step 1).
 
+If a **codex-fork** is the installed codex plugin (the companion path's version segment contains `-fork`, e.g. `.../codex-fork/1.0.6-fork.3/...` — see the detect in step 4), a **dev mode** unlocks two extra onboarding fields: a default **Codex model** and **effort** that are passed to the companion every round so you stop setting them ad-hoc in code. Upstream `codex` (no `-fork` in the version) does not support these flags and the fields stay absent.
+
 **Config location (global, per user):** `~/.claude/cycle-review/config.json`. It is intentionally global — not committed into the reviewed repo, set once, reused across all projects.
 
 **Schema:**
@@ -45,14 +49,16 @@ The skill needs two things from the user, stored once: which review bots they ha
 {
   "reviewers": ["@claude", "@codex"],
   "mode": "cloud",
-  "version": 2
+  "version": 3,
+  "codex_model": "sol",
+  "codex_effort": "xhigh"
 }
 ```
-`reviewers` is a non-empty array of mention handles (valid: `@claude`, `@codex`; order irrelevant) — used by cloud mode. `mode` is `"cloud"` or `"local"` — the default review mode. `version` is `2` since the `mode` field was added; a `version: 1` config (no `mode`) is still valid and is treated as `mode: "cloud"` until re-onboarded.
+`reviewers` is a non-empty array of mention handles (valid: `@claude`, `@codex`; order irrelevant) — used by cloud mode. `mode` is `"cloud"` or `"local"` — the default review mode. `version` is `3`; older configs (v1 without `mode`, v2 without the codex fields) stay valid — `mode` absent means `cloud`, `codex_model`/`codex_effort` absent means "let the companion pick" (the pre-dev-mode behavior). `codex_model`/`codex_effort` are only ever written under dev mode (codex-fork installed); they are optional and absent on upstream codex.
 
 **Flow:**
 
-1. Decide whether onboarding is needed. It is needed when `onboard`, `--onboard`, or `--reconfigure` was passed OR the config is missing/invalid. Detect a valid config with (note: `mode` is NOT required for validity — a v1 config without it stays valid and means cloud):
+1. Decide whether onboarding is needed. It is needed when `onboard`, `--onboard`, or `--reconfigure` was passed OR the config is missing/invalid. Detect a valid config with (note: `mode`, `codex_model`, `codex_effort` are NOT required for validity — a v1/v2 config without them stays valid):
    ```bash
    CONFIG_FILE="$HOME/.claude/cycle-review/config.json"
    jq -e '.reviewers | type == "array" and length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
@@ -60,25 +66,44 @@ The skill needs two things from the user, stored once: which review bots they ha
    ```
    `CONFIGURED` → read the reviewers and mode (the read commands below) and skip to step 1. `NEEDS_ONBOARDING` (missing file, malformed JSON, or empty `reviewers`) → run onboarding.
 
-2. **Run onboarding.** Ask the user TWO `AskUserQuestion` questions (one tool call, two questions):
+2. **Detect dev mode (codex-fork).** Run the companion resolver from step 4.1 and check the version segment of the resolved path:
+   ```bash
+   CODEX_FORK=false
+   [ -n "$COMPANION" ] && case "$COMPANION" in *-fork/*) CODEX_FORK=true;; esac
+   ```
+   (`codex-fork/1.0.6-fork.3/...` → matches `*-fork/*` → `CODEX_FORK=true`. Upstream `codex/1.0.6/...` → `false`. If no codex plugin is installed, `$COMPANION` is empty → `false`, and the dev-mode questions are skipped.)
+
+3. **Run onboarding — first `AskUserQuestion` (always):** reviewers + default mode (one tool call, two questions):
    - **Reviewers** (multi-select): `@claude`, `@codex` — which review bots they have (one or both). Used by cloud mode.
    - **Default mode** (single-select): `cloud` (ping GitHub review bots, autonomous through merge) vs `local` (the built-in `/review` reviews the PR, no bot ping, never auto-merges). This is just the default — a `local`/`cloud` flag always overrides it per run.
 
    Do not free-text-parse either answer; use the structured picker.
 
-3. **Persist the choice.** Build the file with `jq -n` so the JSON is always well-formed (never hand-concatenate strings). Example for "both reviewers, cloud default":
+4. **Run onboarding — second `AskUserQuestion` (dev mode only).** Only when `CODEX_FORK=true`. One tool call, two questions:
+   - **Codex model** (single-select): `spark` / `sol` / `terra` / `luna` (recommended `sol`). Passed to the companion as `--model`.
+   - **Codex effort** (single-select): `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `ultra` (recommended `xhigh`). Passed as `--effort`.
+
+   Skip this call entirely when `CODEX_FORK=false` — config gets no `codex_model`/`codex_effort`. (Values are validated by the companion itself; the skill just forwards them. A bad value surfaces as a companion stderr error → step 6 fail-closed.)
+
+5. **Persist the choice.** Build the file with `jq -n` so the JSON is always well-formed (never hand-concatenate strings). Base for "both reviewers, cloud default":
    ```bash
    CONFIG_DIR="$HOME/.claude/cycle-review"
    CONFIG_FILE="$CONFIG_DIR/config.json"
    mkdir -p "$CONFIG_DIR"
-   jq -n '{reviewers: ["@claude", "@codex"], mode: "cloud", version: 2}' > "$CONFIG_FILE"
+   jq -n '{reviewers: ["@claude", "@codex"], mode: "cloud", version: 3}' > "$CONFIG_FILE"
    ```
-   For a single reviewer, pass a one-element array (`["@claude"]` or `["@codex"]`); for a local default, set `mode: "local"`. Confirm to the user what was saved and where.
+   Then, **only under dev mode**, add the two fields (example `sol`/`xhigh`):
+   ```bash
+   jq '. + {codex_model: "sol", codex_effort: "xhigh"}' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+   ```
+   For a single reviewer, pass a one-element array (`["@claude"]` or `["@codex"]`); for a local default, set `mode: "local"`. Confirm to the user what was saved and where (and whether dev mode was detected).
 
-4. **Read the active config** (always, whether freshly onboarded or already configured):
+6. **Read the active config** (always, whether freshly onboarded or already configured):
    ```bash
    jq -r '.reviewers[]' "$HOME/.claude/cycle-review/config.json"          # reviewers, one per line (cloud mode)
    jq -r '.mode // "cloud"' "$HOME/.claude/cycle-review/config.json"      # default mode; "cloud" when absent (v1 config)
+   jq -r '.codex_model // empty' "$HOME/.claude/cycle-review/config.json" # dev mode only; empty when absent
+   jq -r '.codex_effort // empty' "$HOME/.claude/cycle-review/config.json"# dev mode only; empty when absent
    ```
 
 ### 1. Resolve the active review mode
@@ -88,6 +113,12 @@ Decide cloud vs local for this run, then remember it — every later branch (ste
 1. **Flag wins.** If `$ARGUMENTS` had a standalone leading `local` / `cloud` (or `--local` / `--cloud`) token, use that mode and remember it was stripped from PR-number parsing.
 2. **Else config.** Use the `mode` read in step 0 (`"cloud"` when the field is absent).
 3. **Announce it** so the run is self-documenting, e.g. `Review mode: local (built-in /review; will not auto-merge).` or `Review mode: cloud (pinging @claude @codex).`
+
+4. **Dev-mode per-run override (codex-fork only).** Parse and strip these tokens from `$ARGUMENTS` before PR-number parsing, exactly like the `local`/`cloud`/`onboard` tokens:
+   - `--model <v>` (or `model=<v>`) → `RUN_MODEL=<v>` — overrides `codex_model` for this run.
+   - `--effort <v>` (or `effort=<v>`) → `RUN_EFFORT=<v>` — overrides `codex_effort` for this run.
+
+   These overrides apply **only under dev mode** (step 0 detected `CODEX_FORK=true`). On upstream codex they are ignored with a one-line note ("`--model`/`--effort` ignored — upstream codex doesn't accept them"). The resolved values (`RUN_MODEL`/`RUN_EFFORT`, else the config fields) are consumed in step 4.1 when building the companion flags.
 
 In **local** mode no bots are pinged, but the **reviewers list still matters**: the built-in `/review` always runs, and if the list contains `@codex`, Codex also reviews locally via its companion script (step 4). `@claude`-only stays `/review`-only. (The reviewers list read in step 0 is consulted by local step 4 too, not only cloud — no extra read is needed.)
 
@@ -217,9 +248,24 @@ No bot is pinged and no GitHub wait happens. The **built-in `/review` always run
      ```bash
      BASE=$(gh pr view <PR> --json baseRefName -q .baseRefName)   # Bash, dangerouslyDisableSandbox: true
      ```
+   - **Detect dev mode (codex-fork) from the resolved path**, then build the optional `--model`/`--effort` flags from config + per-run override. Dev mode is on when the companion path's version segment contains `-fork`:
+     ```bash
+     CODEX_FORK=false
+     case "$COMPANION" in *-fork/*) CODEX_FORK=true;; esac
+     CODEX_FLAGS=""
+     if [ "$CODEX_FORK" = true ]; then
+       CODEX_MODEL=$(jq -r '.codex_model // empty' "$HOME/.claude/cycle-review/config.json" 2>/dev/null)
+       CODEX_EFFORT=$(jq -r '.codex_effort // empty' "$HOME/.claude/cycle-review/config.json" 2>/dev/null)
+       [ -n "$RUN_MODEL" ]  && CODEX_MODEL="$RUN_MODEL"     # per-run override from step 1
+       [ -n "$RUN_EFFORT" ] && CODEX_EFFORT="$RUN_EFFORT"
+       [ -n "$CODEX_MODEL" ]  && CODEX_FLAGS="$CODEX_FLAGS --model $CODEX_MODEL"
+       [ -n "$CODEX_EFFORT" ] && CODEX_FLAGS="$CODEX_FLAGS --effort $CODEX_EFFORT"
+     fi
+     ```
+     `CODEX_FLAGS` is left empty on upstream codex (`CODEX_FORK=false`) and when no model/effort is configured — the companion then uses its own defaults (the pre-dev-mode behavior). Values are not re-validated here; the companion validates `--model`/`--effort` itself and a bad value surfaces as stderr → step 6 fail-closed.
    - **Invoke the companion in the background, JSON output, against the PR base:**
      ```bash
-     node "$COMPANION" adversarial-review --wait --json --base "$BASE" \
+     node "$COMPANION" adversarial-review --wait --json --base "$BASE" $CODEX_FLAGS \
        "Critical-only review of PR #<PR>: bugs, security vulnerabilities, logical errors, data-loss risks, performance problems. Do NOT nitpick style, naming, formatting, or subjective preferences."
      ```
      Run via **`Bash` with `run_in_background: true`** *and* `dangerouslyDisableSandbox: true` (Codex needs network). `--wait` keeps it blocking *inside* the backgrounded bash, so the background handle completes only when Codex is done. Record the returned background shell id.
