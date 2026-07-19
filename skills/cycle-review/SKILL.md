@@ -126,7 +126,20 @@ The `@codex` bot login is a best-effort default and can vary by integration. On 
 
 ### 2. Multi-PR strategy (run once per invocation)
 
-Skip this step only when there is exactly one PR to handle (single-PR run, no other open PRs by the same author).
+**Own-author gate (runs before any PR-controlled code executes).** Local mode is for **your own PRs only**. For **each** PR resolved below, resolve its author and force cloud mode for any PR you didn't author — **before** steps 3/4/6/7/9 get a chance to run PR-controlled tests/hooks/repro on it:
+```bash
+ME=$(gh api user --jq .login)                                            # Bash, dangerouslyDisableSandbox: true
+for PR in <PR-SET>; do
+  PR_AUTHOR=$(gh pr view "$PR" --json author -q .author.login)
+  if [ "$ACTIVE_MODE" = "local" ] && [ "$PR_AUTHOR" != "$ME" ]; then
+    echo "PR #$PR authored by $PR_AUTHOR (not $ME) — this PR will be reviewed in CLOUD mode (local review is for your own PRs only)."
+    # mark this PR's effective mode = cloud; step 4/6/7/9 must honor it per-PR
+  fi
+done
+```
+This gate is the **primary** local-safety boundary (step 4 repeats it defensively, but it must run here, before any execution). A foreign PR in cloud mode is reviewed by the vendor runner; no local `/review`, no local Codex companion, no local executable reproduction, no local test/hooks run on the user's machine. The conservative-execution trust gate in step 6 (author == `@me`) is the secondary check.
+
+Skip the rest of this step only when there is exactly one PR to handle (single-PR run, no other open PRs by the same author).
 
 1. **Build the PR set:**
    - If `$ARGUMENTS` lists explicit PR numbers — use exactly those (this is the only way other authors' PRs enter the queue).
@@ -221,9 +234,10 @@ Create any scratch worktree at exactly `ROUND_HEAD_SHA`; do not resolve a newer 
 
 #### Cloud — ping the bots (SHA-attested)
 
-**Record object-ID floors before the request** so step 6 can tell this round's reviews from older ones (defeats reuse of an old review of the same SHA). Use `set -o pipefail` so a failed `gh api` (outage/rate-limit) surfaces instead of silently producing floor `0` (which would make old objects look new):
+**Record object-ID floors before the request** so step 6 can tell this round's reviews from older ones (defeats reuse of an old review of the same SHA). Resolve `REPO_NWO` **first** (it's used by both queries), then run them under `set -euo pipefail` so a failed `gh api` (outage/rate-limit) **aborts** instead of silently leaving a floor at `0` (which would make old objects look new):
 ```bash
-set -o pipefail
+set -euo pipefail
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)                 # Bash, dangerouslyDisableSandbox: true
 ROUND_REVIEW_ID_FLOOR=$(gh api --paginate "repos/$REPO_NWO/pulls/$PR/reviews?per_page=100" | jq -s '[(add // [])[]? | .id] | max // 0')
 ROUND_INLINE_ID_FLOOR=$(gh api --paginate "repos/$REPO_NWO/pulls/$PR/comments?per_page=100" | jq -s '[(add // [])[]? | .id] | max // 0')
 ```
@@ -280,10 +294,7 @@ Any mismatch before an invoke → do **not** invoke that reviewer; discard the r
      If `$COMPANION` is empty, the codex plugin is **not installed** at user scope (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 6.
 
      > Why not `${CLAUDE_PLUGIN_ROOT}`? That env var is substituted by Claude Code only inside the *owning* plugin's commands/hooks — in a cycle-review session it points at cycle-review (or is unset), so it can't address a sibling plugin. `installed_plugins.json` is the only cross-plugin source of truth for install paths.
-   - **Get the PR's base ref** (this is what makes `--base` equal the PR diff, since local mode is checked out on the PR branch):
-     ```bash
-     BASE=$(gh pr view <PR> --json baseRefName -q .baseRefName)   # Bash, dangerouslyDisableSandbox: true
-     ```
+   - **Base for the review is the round's immutable base SHA** (`ROUND_BASE_SHA` from step 4) — pass that, **not** the mutable branch name. The companion resolves `--base` via local `git merge-base`/`git diff`, so a mutable name (e.g. `main`) would let a stale local ref review the wrong diff while the record stores the current remote base SHA.
    - **Detect dev mode (codex-fork) from the resolved path**, then build the optional `--model`/`--effort` flags from config + per-run override. Dev mode is on when the companion path contains a `-fork/` segment:
      ```bash
      CODEX_FORK=false
@@ -301,7 +312,7 @@ Any mismatch before an invoke → do **not** invoke that reviewer; discard the r
      `CODEX_FLAGS` is left empty on upstream codex (`CODEX_FORK=false`) and when no model/effort is configured — the companion then uses its own defaults (the pre-dev-mode behavior). Values are not re-validated here; the companion validates `--model`/`--effort` itself and a bad value surfaces as stderr → step 6 fail-closed.
    - **Invoke the companion in the background, JSON output, against the PR base:**
      ```bash
-     node "$COMPANION" adversarial-review --wait --json --base "$BASE" $CODEX_FLAGS \
+     node "$COMPANION" adversarial-review --wait --json --base "$ROUND_BASE_SHA" $CODEX_FLAGS \
        "Critical-only review of PR #<PR>: bugs, security vulnerabilities, logical errors, data-loss risks, performance problems. Do NOT nitpick style, naming, formatting, or subjective preferences."
      ```
      Run via **`Bash` with `run_in_background: true`** *and* `dangerouslyDisableSandbox: true` (Codex needs network). `--wait` keeps it blocking *inside* the backgrounded bash, so the background handle completes only when Codex is done. Record the returned background shell id.
@@ -389,16 +400,14 @@ There is no per-reviewer status, no state file, and nothing to resume — each n
 
 #### Fetch comments (cloud mode)
 
-Read all comments and review comments from **all reviewers** (bot and human). Fetch both issue comments and PR review comments:
+Read all comments and review comments from **all reviewers** (bot and human), **attested to this round's `ROUND_HEAD_SHA`**. Review objects and inline comments carry `commit_id`; accept only **new** ones (`id > floor`) with `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. Fetch:
 ```bash
-# Issue comments (Claude edits its single one here):
+# Issue comments (Claude edits its single one here) — no commit_id; findings-only:
 gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.login, body, created_at}]'
-# PR review objects — body/state/author (Codex posts its review summary here):
-gh pr view <PR> --json reviews --jq '.reviews'
-# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and
-# Claude's inline notes) post actionable issues HERE, and `gh pr view --json reviews`
-# does NOT return them. Miss this surface and a real FIX is silently skipped before merge:
-gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq '[.[] | {id, user: .user.login, path, line, body, created_at}]'
+# PR review objects attested to ROUND_HEAD_SHA (Codex posts its review summary here). Accept only id > ROUND_REVIEW_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
+gh api repos/{owner}/{repo}/pulls/{PR}/reviews --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_REVIEW_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha) and (.state != "PENDING")) | {id, user: .user.login, state, commit_id, body}]'
+# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and Claude's inline notes) post actionable issues HERE, and the review-objects fetch above does NOT return them. Attest: id > ROUND_INLINE_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
+gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_INLINE_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha)) | {id, user: .user.login, path, line, commit_id, body, created_at}]'
 ```
 Process comments from **all three surfaces** and from every reviewer, not just `claude[bot]`. An inline review comment with an actionable finding is a first-class triage input, exactly like an issue comment.
 
@@ -415,7 +424,7 @@ Launch a **triage** subagent (Agent tool — this is the triage engine, distinct
   - **BEHAVIORAL conclusions** (runtime: "crashes on empty input", "race under X", "off-by-one at boundary", "returns wrong value for Y") — grep confirms the code *looks* that way but does **not** prove it's a bug. Requires a stated **oracle** (spec, invariant, compatibility contract, established behavior) **plus** runtime evidence. Apply the TDD evidence gate below.
 - **Executable evidence gate for BEHAVIORAL claims — conservative execution, not isolation.** A prompt-only skill is **not** a security boundary. A scratch worktree separates files and pins a revision; it does **not** sandbox execution. An allowlisted command name does not make execution safe either — `pytest` may load PR-controlled `conftest.py` and plugins, and repo test runners / build files / package hooks / config may execute arbitrary PR-controlled code.
   - **Before executing any reproducer, make an explicit trust decision.** Treat every repo test command as arbitrary code execution from the PR. Run it only when **all** of these are true:
-    1. The repository and PR provenance are **affirmatively trusted** — e.g. the PR author is you (`@me`), a known collaborator, or otherwise trusted. "No obvious malicious code" is **not** sufficient. **Executable evidence (local reproduction) is for your own / trusted PRs only.** For an untrusted PR, do not run a reproducer at all — the behavioral claim is `UNVERIFIED`, which blocks finalization; the PR must be reviewed in **cloud** mode, where the vendor runner executes in its own environment, not on your machine.
+    1. **The PR is authored by you** (`author == @me`, the authenticated user) — this is the only accepted trust basis; there is no "known collaborator" carve-out. (Local mode is for your own PRs only — step 2 already forced foreign PRs to cloud; this is the secondary check.) **Executable evidence (local reproduction) is for your own PRs only.** For any other PR, do not run a reproducer at all — the behavioral claim is `UNVERIFIED`, which blocks finalization; the PR must be reviewed in **cloud** mode, where the vendor runner executes in its own environment, not on your machine.
     2. Executing arbitrary code from the pinned PR SHA with the current process's ambient filesystem, credentials, and network access would be acceptable.
     3. The PR contains **no** suspicious or unexpected changes to test bootstraps, `conftest.py`, test plugins, runner scripts, build/package hooks, dependency-install paths, or command config.
     4. The reproducer uses only the repo's already-established, allowlisted test command. It requires **no** dependency install, bootstrap script, arbitrary PR-supplied script, elevated privilege, secret, external service, or destructive operation.
