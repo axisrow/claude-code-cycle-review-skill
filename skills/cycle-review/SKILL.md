@@ -197,22 +197,27 @@ No bot is pinged and no GitHub wait happens. The **Claude subagent always runs**
 **Launch both in parallel, then wait for both:**
 
 1. **Start Codex first (background) when `@codex` is configured**, so it runs while the Claude subagent works:
-   - **Resolve the companion path from the installed-plugins manifest — never hardcode the source namespace or path layout.** `~/.claude/plugins/installed_plugins.json` is the canonical plugin→installPath index (`{ "version": 2, "plugins": { "<name>@<marketplace>": [{ installPath, version, scope, lastUpdated, ... }] } }`). A plugin key may have several entries (user/local/project scope), so pick the **newest `lastUpdated`** — that is the actively installed version, NOT the newest version sitting in the file cache (the cache holds leftovers the GC sweeps away; `.in_use/` PID-markers only protect from sweep, they don't pick the version). The codex plugin can appear under different names/namespaces (`codex@openai-codex` upstream vs `codex-fork@etopro-plugins` fork) and two path layouts (fork is a meta-plugin wrapping a `codex` sub-plugin), so match by name and probe both layouts, verifying the file exists:
+   - **Resolve the companion path from the installed-plugins manifest — never hardcode the source namespace or path layout.** `~/.claude/plugins/installed_plugins.json` is the canonical plugin→installPath index (`{ "version": 2, "plugins": { "<name>@<marketplace>": [{ installPath, version, scope, projectPath, lastUpdated, ... }] } }`). Filter carefully, because the chosen script runs with `dangerouslyDisableSandbox: true` (network) — a wrong pick can execute an unrelated plugin impersonating the reviewer:
+     1. **Only `scope: "user"` entries.** A `user`-scoped install is globally enabled and valid in any repo. `local`/`project` entries are tied to another repo's `projectPath` and must NOT be eligible outside it — never run a plugin the user only enabled for a different project.
+     2. **Explicit codex names only.** Match the plugin name (the part before `@`) against an allowlist of known codex plugins — `codex` (upstream `codex@openai-codex`) and `codex-fork` (`codex-fork@etopro-plugins`). A loose substring match (`codex`) risks catching an unrelated plugin whose name merely contains it.
+     3. **Newest `lastUpdated` first.** Among the surviving entries, order by `lastUpdated` descending — that is the actively installed version, NOT the newest version sitting in the file cache (the cache holds leftovers the GC sweeps away; `.in_use/` PID-markers only protect from sweep, they don't pick the version).
+     4. **Probe both path layouts, first existing wins** (preserving the timestamp order above — do NOT re-sort by path): the fork is a meta-plugin wrapping a `codex` sub-plugin (`<installPath>/plugins/codex/scripts/codex-companion.mjs`); the upstream direct plugin is `<installPath>/scripts/codex-companion.mjs`.
      ```bash
      COMPANION=$(jq -r '
          .plugins | to_entries[]
-         | select(.key | split("@")[0] | test("codex"))
+         | select(.key | split("@")[0] | test("^codex(-fork)?$"))
          | .value[]
-         | "\(.lastUpdated // .installedAt // "")\t\(.installPath)"
+         | select(.scope == "user")
+         | select(.installPath and (.installPath | length > 0))
+         | "\(.lastUpdated // "")\t\(.installPath)"
        ' "$HOME"/.claude/plugins/installed_plugins.json 2>/dev/null \
        | sort -r | while IFS=$'\t' read -r _ ip; do
-           [ -n "$ip" ] || continue
            for cand in "$ip/plugins/codex/scripts/codex-companion.mjs" "$ip/scripts/codex-companion.mjs"; do
-             [ -f "$cand" ] && echo "$cand"
+             [ -f "$cand" ] && { echo "$cand"; break 2; }
            done
-         done | sort -u | tail -1)
+         done)
      ```
-     If `$COMPANION` is empty, the codex plugin is **not installed** (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 4.
+     If `$COMPANION` is empty, the codex plugin is **not installed** at user scope (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 4.
 
      > Why not `${CLAUDE_PLUGIN_ROOT}`? That env var is substituted by Claude Code only inside the *owning* plugin's commands/hooks — in a cycle-review session it points at cycle-review (or is unset), so it can't address a sibling plugin. `installed_plugins.json` is the only cross-plugin source of truth for install paths.
    - **Get the PR's base ref** (this is what makes `--base` equal the PR diff, since local mode is checked out on the PR branch):
