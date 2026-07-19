@@ -131,8 +131,9 @@ The `@codex` bot login is a best-effort default and can vary by integration. On 
 set -euo pipefail
 ME=$(gh api user --jq .login)                                            # Bash, dangerouslyDisableSandbox: true
 PR_AUTHOR=$(gh pr view <PR> --json author -q .author.login)
-test -n "$ME" && test -n "$PR_AUTHOR" || { echo "Could not resolve author/identity (API/auth failure); treating as foreign (OWN_PR=false)."; OWN_PR=false; }
-[ "$PR_AUTHOR" = "$ME" ] && OWN_PR=true || OWN_PR=false
+# Fail-closed: OWN_PR=true ONLY when both are non-empty AND match.
+# Empty-but-successful lookups (API quirk) → "" != "" is false → OWN_PR=false.
+test -n "$ME" && test -n "$PR_AUTHOR" && [ "$PR_AUTHOR" = "$ME" ] && OWN_PR=true || OWN_PR=false
 ```
 Additionally, if `ACTIVE_MODE = local` and `OWN_PR = false`, force this PR's mode to **cloud** (local mode won't run `/review`/Codex/repro on a foreign PR anyway). But note: **a foreign PR in cloud mode still must not have its code executed locally** — steps 3/7/9/10 gate local edits/test/lint/repro/CI-fix on `OWN_PR`, not on mode. `OWN_PR=false` ⇒ no local execution of PR-controlled code anywhere, regardless of mode. `OWN_PR=true` ⇒ local execution is allowed (it's your own code), in whichever mode is active.
 
