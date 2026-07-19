@@ -180,6 +180,8 @@ Skip the rest of this step only when there is exactly one PR to handle (single-P
 
 Run this **once per PR, before step 4** — do NOT ask the bots to review a half-finished PR. Review bots check whether the *code* is correct, not whether it is *complete* relative to the issue's design; a PR can be approved by both bots and still ship only half of what the issue asked for. Catch that here, up front, not after a wasted review round (or after merging an incomplete issue).
 
+**Mode-aware (do not execute PR-controlled code for a foreign PR).** The gap-closing work in step 3.4 (implement missing pieces, run the repo's test suite/linter, commit, push) is **only for a PR whose effective mode is local** (your own PR, `author == @me`, per the step-2 gate). For a **cloud-effective** PR (foreign author), this step is **read-only**: read the linked issue and check the diff for completeness, but do **not** write code into the PR, do **not** run its test suite / linter / hooks on your machine (that's the vendor runner's job in cloud mode). If a foreign PR has a completeness gap, surface it to the user and stop — don't fix someone else's PR locally.
+
 1. **Find the linked issue.** A repo convention may require a closing keyword (`Closes #N`) in every PR. Read the PR body and the structured closing references:
    ```bash
    gh pr view <PR> --json body,closingIssuesReferences \
@@ -402,12 +404,12 @@ There is no per-reviewer status, no state file, and nothing to resume — each n
 
 Read all comments and review comments from **all reviewers** (bot and human), **attested to this round's `ROUND_HEAD_SHA`**. Review objects and inline comments carry `commit_id`; accept only **new** ones (`id > floor`) with `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. Fetch:
 ```bash
-# Issue comments (Claude edits its single one here) — no commit_id; findings-only:
-gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.login, body, created_at}]'
-# PR review objects attested to ROUND_HEAD_SHA (Codex posts its review summary here). Accept only id > ROUND_REVIEW_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
-gh api repos/{owner}/{repo}/pulls/{PR}/reviews --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_REVIEW_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha) and (.state != "PENDING")) | {id, user: .user.login, state, commit_id, body}]'
-# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and Claude's inline notes) post actionable issues HERE, and the review-objects fetch above does NOT return them. Attest: id > ROUND_INLINE_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
-gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_INLINE_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha)) | {id, user: .user.login, path, line, commit_id, body, created_at}]'
+# Issue comments (Claude edits its single one here) — no commit_id; findings-only (paginate; pipe to jq):
+gh api --paginate repos/{owner}/{repo}/issues/{PR}/comments | jq -s '[.[][] | {id, user: .user.login, body, created_at}]'
+# PR review objects attested to ROUND_HEAD_SHA (Codex posts its review summary here). Accept only id > ROUND_REVIEW_ID_FLOOR and commit_id == ROUND_HEAD_SHA (paginate; pipe — gh api does NOT forward jq --arg/--argjson):
+gh api --paginate repos/{owner}/{repo}/pulls/{PR}/reviews | jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_REVIEW_ID_FLOOR" -s '[(.[][] ) | select((.id > $floor) and (.commit_id == $sha) and (.state != "PENDING")) | {id, user: .user.login, state, commit_id, body}]'
+# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and Claude's inline notes) post actionable issues HERE, and the review-objects fetch above does NOT return them. Attest: id > ROUND_INLINE_ID_FLOOR and commit_id == ROUND_HEAD_SHA (paginate; pipe):
+gh api --paginate repos/{owner}/{repo}/pulls/{PR}/comments | jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_INLINE_ID_FLOOR" -s '[(.[][]) | select((.id > $floor) and (.commit_id == $sha)) | {id, user: .user.login, path, line, commit_id, body, created_at}]'
 ```
 Process comments from **all three surfaces** and from every reviewer, not just `claude[bot]`. An inline review comment with an actionable finding is a first-class triage input, exactly like an issue comment.
 
@@ -494,6 +496,8 @@ The cycle counter lives only in your working memory across a long conversation, 
 
 Only fix comments with the `FIX` verdict from step 6 — and fix them **properly**, not as throwaway patches. Each `FIX` is a bug; treat it as one and run a real bug-fix pipeline, not "edit until it looks right".
 
+**Mode-aware.** This step (and its test/lint runs) is **only for a PR whose effective mode is local** (your own PR). For a **cloud-effective** PR (foreign author), do **not** edit the PR or run its test suite / linter / reproduction on your machine — `FIX` verdicts on a foreign PR are surfaced to the user (and to the bots in the next cloud round), not applied locally. Fixing someone else's PR locally would execute PR-controlled code with your ambient credentials.
+
 For **each** `FIX` verdict, in turn:
 
 1. **Reproduce it first (test-first).** If step 6 already produced a confirmed reproducing test for this `FIX` (behavioral claim, reproduced in the scratch worktree), **use it** — re-apply it to the production tree and confirm it still fails for the right reason; don't rewrite it. Otherwise write a test that **fails** because of the bug — the test must encode the reviewer's claim (read the file/line, confirm the claim in step 6 already verified it's real) and turn red on the current code. Run it and confirm it fails **for the right reason** (the bug), not for a setup/import error. If the repo has no test framework or the bug genuinely can't be reproduced by a test (e.g. a doc-only issue, an architectural concern, a cross-process/race bug with no test seam) — note that explicitly and fall through to the direct fix below, but do not skip the test by default.
@@ -515,6 +519,8 @@ Only after every `FIX` is fixed this way does the round proceed to step 8 (commi
 ### 9. Final cleanup pass (last cycle — apply the accumulated minor findings)
 
 Reached only on the **final cycle** — when a round has no `FIX` verdicts (step 6) and a real review happened. This is the last cycle: there will be **no further review round** after it. Before finalizing, spend this one pass cleaning up everything that was correct-but-not-blocking and was therefore deferred across the earlier rounds, so nothing useful is left on the table.
+
+**Mode-aware.** Applying cleanup edits (and running the test suite/linter) is **only for a PR whose effective mode is local** (your own PR). For a **cloud-effective** PR (foreign author), this step is a **no-op**: do not edit the PR or run its tests/linter locally — the accumulated `SKIP`/nice-to-have findings are surfaced to the user and the bots, not applied on your machine.
 
 1. **Gather the minor findings from EVERY previous review round, not just the last one.** Re-read all findings across the whole PR history — **cloud**: all three GitHub surfaces (issue comments, PR reviews, inline review comments — same fetch as step 6); **local**: read each prior round's **per-run findings file** written in step 4.7 (each round's merged `/review` + Codex findings persisted at `~/.claude/cycle-review/runs/<PR>-round<N>.json`), plus any human comments on the PR. Do NOT try to re-fetch `/review`'s output from GitHub — it never posted a PR comment — and do NOT look for a "recorded Codex JSON": the only persistence of either is the per-run file written in step 4.7. Collect every finding that is real and actionable but was not a `FIX`:
    - all `SKIP` (genuine cosmetic/style/naming/minor-improvement findings), and
