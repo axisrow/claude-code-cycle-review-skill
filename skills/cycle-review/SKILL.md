@@ -126,18 +126,16 @@ The `@codex` bot login is a best-effort default and can vary by integration. On 
 
 ### 2. Multi-PR strategy (run once per invocation)
 
-**Own-author gate (runs before any PR-controlled code executes).** Local mode is for **your own PRs only**. For **each** PR resolved below, resolve its author and force cloud mode for any PR you didn't author — **before** steps 3/4/6/7/9 get a chance to run PR-controlled tests/hooks/repro on it:
+**Ownership gate (runs before any PR-controlled code executes).** The trust predicate throughout the skill is **ownership** (`author == @me`), NOT review mode — cloud is the default and legitimately reviews your own PRs, so mode is not a trust signal. For **each** PR, resolve ownership once; the rest of the skill (steps 3/4/6/7/9/10) gates local execution on it. **Fail-closed**: if either lookup fails or returns empty (auth/rate-limit/outage), `OWN_PR` defaults to `false` — never `true` on missing data:
 ```bash
+set -euo pipefail
 ME=$(gh api user --jq .login)                                            # Bash, dangerouslyDisableSandbox: true
-for PR in <PR-SET>; do
-  PR_AUTHOR=$(gh pr view "$PR" --json author -q .author.login)
-  if [ "$ACTIVE_MODE" = "local" ] && [ "$PR_AUTHOR" != "$ME" ]; then
-    echo "PR #$PR authored by $PR_AUTHOR (not $ME) — this PR will be reviewed in CLOUD mode (local review is for your own PRs only)."
-    # mark this PR's effective mode = cloud; step 4/6/7/9 must honor it per-PR
-  fi
-done
+PR_AUTHOR=$(gh pr view <PR> --json author -q .author.login)
+# Fail-closed: OWN_PR=true ONLY when both are non-empty AND match.
+# Empty-but-successful lookups (API quirk) → "" != "" is false → OWN_PR=false.
+test -n "$ME" && test -n "$PR_AUTHOR" && [ "$PR_AUTHOR" = "$ME" ] && OWN_PR=true || OWN_PR=false
 ```
-This gate is the **primary** local-safety boundary (step 4 repeats it defensively, but it must run here, before any execution). A foreign PR in cloud mode is reviewed by the vendor runner; no local `/review`, no local Codex companion, no local executable reproduction, no local test/hooks run on the user's machine. The conservative-execution trust gate in step 6 (author == `@me`) is the secondary check.
+Additionally, if `ACTIVE_MODE = local` and `OWN_PR = false`, force this PR's mode to **cloud** (local mode won't run `/review`/Codex/repro on a foreign PR anyway). But note: **a foreign PR in cloud mode still must not have its code executed locally** — steps 3/7/9/10 gate local edits/test/lint/repro/CI-fix on `OWN_PR`, not on mode. `OWN_PR=false` ⇒ no local execution of PR-controlled code anywhere, regardless of mode. `OWN_PR=true` ⇒ local execution is allowed (it's your own code), in whichever mode is active.
 
 Skip the rest of this step only when there is exactly one PR to handle (single-PR run, no other open PRs by the same author).
 
@@ -179,6 +177,8 @@ Skip the rest of this step only when there is exactly one PR to handle (single-P
 ### 3. Verify the PR implements its linked issue 100% (before any review)
 
 Run this **once per PR, before step 4** — do NOT ask the bots to review a half-finished PR. Review bots check whether the *code* is correct, not whether it is *complete* relative to the issue's design; a PR can be approved by both bots and still ship only half of what the issue asked for. Catch that here, up front, not after a wasted review round (or after merging an incomplete issue).
+
+**Ownership-aware (do not execute PR-controlled code for a foreign PR).** The gap-closing work in step 3.4 (implement missing pieces, run the repo's test suite/linter, commit, push) is **only for a PR you own** (`OWN_PR=true`, `author == @me`, per the step-2 gate). For a **foreign PR** (`OWN_PR=false`), this step is **read-only**: read the linked issue and check the diff for completeness, but do **not** write code into the PR, do **not** run its test suite / linter / hooks on your machine. If a foreign PR has a completeness gap, surface it to the user and stop — don't fix someone else's PR locally.
 
 1. **Find the linked issue.** A repo convention may require a closing keyword (`Closes #N`) in every PR. Read the PR body and the structured closing references:
    ```bash
@@ -400,14 +400,15 @@ There is no per-reviewer status, no state file, and nothing to resume — each n
 
 #### Fetch comments (cloud mode)
 
-Read all comments and review comments from **all reviewers** (bot and human), **attested to this round's `ROUND_HEAD_SHA`**. Review objects and inline comments carry `commit_id`; accept only **new** ones (`id > floor`) with `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. Fetch:
+Read all comments and review comments from **all reviewers** (bot and human), **attested to this round's `ROUND_HEAD_SHA`**. Review objects and inline comments carry `commit_id`; accept only **new** ones (`id > floor`) with `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. Fetch under **`set -euo pipefail`** so that a failed `gh api` **aborts the whole triage** (not just sets a non-zero status that later commands ignore). Without `set -e`, `pipefail` alone lets a later successful fetch mask an earlier failure → silently dropped surface → merge authorizes without critical findings:
 ```bash
-# Issue comments (Claude edits its single one here) — no commit_id; findings-only:
-gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.login, body, created_at}]'
-# PR review objects attested to ROUND_HEAD_SHA (Codex posts its review summary here). Accept only id > ROUND_REVIEW_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
-gh api repos/{owner}/{repo}/pulls/{PR}/reviews --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_REVIEW_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha) and (.state != "PENDING")) | {id, user: .user.login, state, commit_id, body}]'
-# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and Claude's inline notes) post actionable issues HERE, and the review-objects fetch above does NOT return them. Attest: id > ROUND_INLINE_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
-gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_INLINE_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha)) | {id, user: .user.login, path, line, commit_id, body, created_at}]'
+set -euo pipefail
+# Issue comments (Claude edits its single one here) — no commit_id; findings-only (paginate; pipe to jq):
+gh api --paginate repos/{owner}/{repo}/issues/{PR}/comments | jq -s '[.[][] | {id, user: .user.login, body, created_at}]'
+# PR review objects attested to ROUND_HEAD_SHA (Codex posts its review summary here). Accept only id > ROUND_REVIEW_ID_FLOOR and commit_id == ROUND_HEAD_SHA (paginate; pipe — gh api does NOT forward jq --arg/--argjson):
+gh api --paginate repos/{owner}/{repo}/pulls/{PR}/reviews | jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_REVIEW_ID_FLOOR" -s '[(.[][] ) | select((.id > $floor) and (.commit_id == $sha) and (.state != "PENDING")) | {id, user: .user.login, state, commit_id, body}]'
+# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and Claude's inline notes) post actionable issues HERE, and the review-objects fetch above does NOT return them. Attest: id > ROUND_INLINE_ID_FLOOR and commit_id == ROUND_HEAD_SHA (paginate; pipe):
+gh api --paginate repos/{owner}/{repo}/pulls/{PR}/comments | jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_INLINE_ID_FLOOR" -s '[(.[][]) | select((.id > $floor) and (.commit_id == $sha)) | {id, user: .user.login, path, line, commit_id, body, created_at}]'
 ```
 Process comments from **all three surfaces** and from every reviewer, not just `claude[bot]`. An inline review comment with an actionable finding is a first-class triage input, exactly like an issue comment.
 
@@ -494,6 +495,8 @@ The cycle counter lives only in your working memory across a long conversation, 
 
 Only fix comments with the `FIX` verdict from step 6 — and fix them **properly**, not as throwaway patches. Each `FIX` is a bug; treat it as one and run a real bug-fix pipeline, not "edit until it looks right".
 
+**Ownership-aware.** This step (and its test/lint runs) is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), do **not** edit the PR or run its test suite / linter / reproduction on your machine — `FIX` verdicts on a foreign PR are surfaced to the user (and to the bots in the next cloud round), not applied locally. Fixing someone else's PR locally would execute PR-controlled code with your ambient credentials. (Note: a PR you own in **cloud** mode is still your PR — `OWN_PR=true` — so this step applies normally; ownership, not mode, gates local execution.)
+
 For **each** `FIX` verdict, in turn:
 
 1. **Reproduce it first (test-first).** If step 6 already produced a confirmed reproducing test for this `FIX` (behavioral claim, reproduced in the scratch worktree), **use it** — re-apply it to the production tree and confirm it still fails for the right reason; don't rewrite it. Otherwise write a test that **fails** because of the bug — the test must encode the reviewer's claim (read the file/line, confirm the claim in step 6 already verified it's real) and turn red on the current code. Run it and confirm it fails **for the right reason** (the bug), not for a setup/import error. If the repo has no test framework or the bug genuinely can't be reproduced by a test (e.g. a doc-only issue, an architectural concern, a cross-process/race bug with no test seam) — note that explicitly and fall through to the direct fix below, but do not skip the test by default.
@@ -515,6 +518,8 @@ Only after every `FIX` is fixed this way does the round proceed to step 8 (commi
 ### 9. Final cleanup pass (last cycle — apply the accumulated minor findings)
 
 Reached only on the **final cycle** — when a round has no `FIX` verdicts (step 6) and a real review happened. This is the last cycle: there will be **no further review round** after it. Before finalizing, spend this one pass cleaning up everything that was correct-but-not-blocking and was therefore deferred across the earlier rounds, so nothing useful is left on the table.
+
+**Ownership-aware.** Applying cleanup edits (and running the test suite/linter) is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), this step is a **no-op**: do not edit the PR or run its tests/linter locally — the accumulated `SKIP`/nice-to-have findings are surfaced to the user and the bots, not applied on your machine.
 
 1. **Gather the minor findings from EVERY previous review round, not just the last one.** Re-read all findings across the whole PR history — **cloud**: all three GitHub surfaces (issue comments, PR reviews, inline review comments — same fetch as step 6); **local**: read each prior round's **per-run findings file** written in step 4.7 (each round's merged `/review` + Codex findings persisted at `~/.claude/cycle-review/runs/<PR>-round<N>.json`), plus any human comments on the PR. Do NOT try to re-fetch `/review`'s output from GitHub — it never posted a PR comment — and do NOT look for a "recorded Codex JSON": the only persistence of either is the per-run file written in step 4.7. Collect every finding that is real and actionable but was not a `FIX`:
    - all `SKIP` (genuine cosmetic/style/naming/minor-improvement findings), and
@@ -552,6 +557,8 @@ gh run list --branch <HEAD_BRANCH> --limit 5 --json databaseId,name,status,concl
 gh run view <RUN_ID> --log-failed
 ```
 Identify the root cause, apply fixes to the code, commit and push (follow the commit style from step 8), then return to step 10. Only proceed to step 11 once all checks pass (or the PR has no CI configured).
+
+**Ownership-aware (do not edit a foreign PR's CI failures locally).** Applying CI fixes — editing code, running the repo's test suite/linter (the global pre-commit rule), committing, pushing — is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), do **not** edit/test/commit locally: surface the CI failure to the user (and re-run the bots), do not fix someone else's CI failure on your machine. If a foreign PR's CI can't go green, stop and hand back to the user.
 
 If the same CI check fails more than 2 times after fixes — notify the user and stop: do not merge a broken build.
 
