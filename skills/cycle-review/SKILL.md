@@ -255,7 +255,7 @@ gh pr comment <PR> --body "<MENTIONS> review PR #<PR> at exact head <ROUND_HEAD_
 ```
 For example, with both configured the body starts with `@claude @codex review PR #<PR> at exact head <ROUND_HEAD_SHA> (round <ROUND_NONCE>).`. Run via `Bash` with `dangerouslyDisableSandbox: true`. **Generate a unique round nonce and capture the request comment's ID + timestamp** (step 6 needs them for causally-bound completion — the nonce proves a reviewer's response is for *this* round, not a delayed edit from the previous one):
 ```bash
-ROUND_NONCE="$(date -u +%s)-$$-$(date -u +%N)"   # unique per round: seconds + PID + nanoseconds — guarantees no two concurrent rounds share a nonce
+ROUND_NONCE=$(uuidgen | tr 'A-Z' 'a-z')   # cryptographically unique per round — no collision possible across concurrent rounds (date/PID-based nonces collide on macOS where %N is unsupported and subshells share $$)
 REQUEST_COMMENT_ID=$(gh pr comment <PR> --body "<MENTIONS> review PR #<PR> at exact head <ROUND_HEAD_SHA> (round $ROUND_NONCE). ..." | grep -oE '[0-9]+$')
 ROUND_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ```
