@@ -553,23 +553,24 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
 
 If, after re-reading every round, there are genuinely no minor findings to apply (a clean PR that never accrued any `SKIP`/nice-to-have), this step is a no-op — cloud proceeds to step 10; local proceeds to its stop-and-report.
 
-**Post a final review-summary table on the PR** (both modes). Accumulate from **every** prior review round (the per-cycle triage results in memory + the step-4.7 per-run findings files) — not just the last round. This is the roll-up of the entire review history: what was caught, what was fixed (and in which commit), what was deliberately skipped, and what was UNVERIFIED. Post it as one PR comment:
+**Post a final review-summary table on the PR** (both modes). Accumulate from **every** prior review round — include findings from **both** reviewers (claude `/review` AND Codex companion, plus any human comments). This is the roll-up of the entire review history: what was caught, what was fixed (and in which commit), what was deliberately skipped, and what was UNVERIFIED. **Do NOT interpolate review titles directly into a shell heredoc** — a title containing a newline + `EOF` would terminate the heredoc and allow shell injection (especially dangerous in cloud mode with untrusted PR review text). Instead, build the body safely: write each row to a temp file with `printf '%s\n'`, or use `jq -n --arg` to construct the JSON body, then pass it to `gh pr comment`. Example shape:
 ```bash
-gh pr comment <PR> --body "$(cat <<'EOF'
-## 📋 Review summary — all cycles
-
-| Cycle | Reviewer | Finding | Verdict | Resolution |
-|---|---|---|---|---|
-| 1 | codex | <title> | FIX | Fixed in `<sha>` |
-| 1 | claude | <title> | SKIP | Left as-is |
-| 2 | codex | <title> | FIX | Fixed in `<sha>` |
-| ... | ... | ... | ... | ... |
-
-**Totals:** <N> FIX (all resolved), <N> SKIP (deferred/cosmetic), <N> UNVERIFIED (blocked).
-EOF
-)"
+TMPFILE=$(mktemp)
+{
+  printf '%s\n' "## 📋 Review summary — all cycles"
+  printf '%s\n' ""
+  printf '%s\n' "| Cycle | Reviewer | Finding | Verdict | Resolution |"
+  printf '%s\n' "|---|---|---|---|---|"
+  printf '%s\n' "| 1 | codex | <sanitized title> | FIX | Fixed in <sha> |"
+  printf '%s\n' "| 1 | claude | <sanitized title> | SKIP | Left as-is |"
+  printf '%s\n' "| ... | ... | ... | ... | ... |"
+  printf '%s\n' ""
+  printf '%s\n' "**Totals:** <N> FIX (all resolved), <N> SKIP (deferred/cosmetic), <N> UNVERIFIED (blocked)."
+} > "$TMPFILE"
+gh pr comment <PR> --body-file "$TMPFILE"   # Bash, dangerouslyDisableSandbox: true
+rm -f "$TMPFILE"
 ```
-Run via `Bash` with `dangerouslyDisableSandbox: true`. This table is informational — it does not affect merge decisions. After posting it: **cloud** proceeds to step 10; **local** reports to the user that the review cycle is complete (+ cleanup `<sha>` if any), and that merge is theirs to trigger.
+(Sanitize each title: truncate to ~80 chars, strip newlines/pipe-characters that break markdown tables. `--body-file` avoids any shell-interpolation.) This table is informational — it does not affect merge decisions. After posting it: **cloud** proceeds to step 10; **local** reports to the user that the review cycle is complete (+ cleanup `<sha>` if any), and that merge is theirs to trigger.
 
 ### 10. Check CI before merge — **cloud mode only**
 
