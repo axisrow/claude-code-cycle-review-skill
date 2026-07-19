@@ -126,7 +126,20 @@ The `@codex` bot login is a best-effort default and can vary by integration. On 
 
 ### 2. Multi-PR strategy (run once per invocation)
 
-Skip this step only when there is exactly one PR to handle (single-PR run, no other open PRs by the same author).
+**Own-author gate (runs before any PR-controlled code executes).** Local mode is for **your own PRs only**. For **each** PR resolved below, resolve its author and force cloud mode for any PR you didn't author — **before** steps 3/4/6/7/9 get a chance to run PR-controlled tests/hooks/repro on it:
+```bash
+ME=$(gh api user --jq .login)                                            # Bash, dangerouslyDisableSandbox: true
+for PR in <PR-SET>; do
+  PR_AUTHOR=$(gh pr view "$PR" --json author -q .author.login)
+  if [ "$ACTIVE_MODE" = "local" ] && [ "$PR_AUTHOR" != "$ME" ]; then
+    echo "PR #$PR authored by $PR_AUTHOR (not $ME) — this PR will be reviewed in CLOUD mode (local review is for your own PRs only)."
+    # mark this PR's effective mode = cloud; step 4/6/7/9 must honor it per-PR
+  fi
+done
+```
+This gate is the **primary** local-safety boundary (step 4 repeats it defensively, but it must run here, before any execution). A foreign PR in cloud mode is reviewed by the vendor runner; no local `/review`, no local Codex companion, no local executable reproduction, no local test/hooks run on the user's machine. The conservative-execution trust gate in step 6 (author == `@me`) is the secondary check.
+
+Skip the rest of this step only when there is exactly one PR to handle (single-PR run, no other open PRs by the same author).
 
 1. **Build the PR set:**
    - If `$ARGUMENTS` lists explicit PR numbers — use exactly those (this is the only way other authors' PRs enter the queue).
@@ -194,20 +207,41 @@ Run this **once per PR, before step 4** — do NOT ask the bots to review a half
 
 ### 4. Request review
 
-**Bind this review round to one PR-head SHA.** Before requesting or running any reviewer, capture the full head OID — all review collection, static verification, scratch-worktree reproduction, and triage in this round apply **only** to this SHA:
+**Local mode is for your own PRs only.** Resolve the author for **each** PR (including every PR in a multi-PR queue) and force cloud mode for anything you didn't author — local review runs PR-controlled code on your machine, which is only acceptable for your own code; foreign PRs must be reviewed in cloud mode where the vendor runner provides the isolation/atomicity the skill can't:
 ```bash
-ROUND_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)   # Bash, dangerouslyDisableSandbox: true
-test -n "$ROUND_SHA" || { echo "Could not resolve PR head SHA; stop."; exit 1; }
+ME=$(gh api user --jq .login)                                            # Bash, dangerouslyDisableSandbox: true
+PR_SNAPSHOT=$(gh pr view <PR> --json author,headRefOid,baseRefName,baseRefOid)
+PR_AUTHOR=$(jq -r '.author.login' <<<"$PR_SNAPSHOT")
+if [ "$ACTIVE_MODE" = "local" ] && [ "$PR_AUTHOR" != "$ME" ]; then
+  ACTIVE_MODE=cloud
+  echo "PR #<PR> is authored by $PR_AUTHOR, not $ME — forcing cloud mode (local review is for your own PRs only)."
+fi
 ```
-Create any scratch worktree at exactly `ROUND_SHA`; do not resolve a newer SHA per-finding.
+For a foreign PR, do **not** launch `/review`, the local Codex companion, or any local executable reproduction. If cloud review then cannot run, stop.
+
+**Bind this review round to both sides of the reviewed diff** (head **and** base — base advancement is normal repo activity, and a review against a stale base must not authorize a merge). Resolve all four once, at round start; all review collection, static verification, scratch-worktree reproduction, and triage in this round apply only to this snapshot:
+```bash
+ROUND_HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_SNAPSHOT")
+ROUND_BASE_REF=$(jq -r '.baseRefName' <<<"$PR_SNAPSHOT")
+ROUND_BASE_SHA=$(jq -r '.baseRefOid'  <<<"$PR_SNAPSHOT")
+test -n "$ROUND_HEAD_SHA" && test -n "$ROUND_BASE_SHA" || { echo "Could not resolve PR head/base SHA; stop."; exit 1; }
+```
+Create any scratch worktree at exactly `ROUND_HEAD_SHA`; do not resolve a newer SHA per-finding. (The per-run review-binding record — `author`, `reviewed_head_sha`, `reviewed_base_ref`, `reviewed_base_sha` — is written only in step 6's terminal-success transition and consumed in step 11; nothing is written here.)
 
 **Branch on the active mode (step 1).**
 
 **Cloud:** ping the configured bots. **Local:** run the built-in `/review` (plus Codex when `@codex` is configured). In both modes, launch everything that runs in parallel up front, then step 5 waits (cloud) or step 6 collects (local).
 
-#### Cloud — ping the bots
+#### Cloud — ping the bots (SHA-attested)
 
-Ping **all configured reviewers in a single comment** — concatenate every configured mention, space-separated, at the start of the body. The mention string depends on the active reviewers list from step 0:
+**Record object-ID floors before the request** so step 6 can tell this round's reviews from older ones (defeats reuse of an old review of the same SHA). Resolve `REPO_NWO` **first** (it's used by both queries), then run them under `set -euo pipefail` so a failed `gh api` (outage/rate-limit) **aborts** instead of silently leaving a floor at `0` (which would make old objects look new):
+```bash
+set -euo pipefail
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)                 # Bash, dangerouslyDisableSandbox: true
+ROUND_REVIEW_ID_FLOOR=$(gh api --paginate "repos/$REPO_NWO/pulls/$PR/reviews?per_page=100" | jq -s '[(add // [])[]? | .id] | max // 0')
+ROUND_INLINE_ID_FLOOR=$(gh api --paginate "repos/$REPO_NWO/pulls/$PR/comments?per_page=100" | jq -s '[(add // [])[]? | .id] | max // 0')
+```
+Ping **all configured reviewers in a single comment** — concatenate every configured mention, space-separated, at the start of the body, **and name the exact head SHA** so reviewers (and step 6) bind the review to `ROUND_HEAD_SHA`:
 
 | Configured reviewers | Mention string `<MENTIONS>` |
 |---|---|
@@ -217,15 +251,24 @@ Ping **all configured reviewers in a single comment** — concatenate every conf
 
 Then post one comment:
 ```
-gh pr comment <PR> --body "<MENTIONS> review. Focus on critical issues: bugs, security vulnerabilities, logical errors, data loss risks, performance problems. Do NOT nitpick style, naming conventions, minor formatting, or subjective preferences — only flag issues that could break functionality or cause real harm in production."
+gh pr comment <PR> --body "<MENTIONS> review PR #<PR> at exact head <ROUND_HEAD_SHA>. Focus on critical issues: bugs, security vulnerabilities, logical errors, data loss risks, performance problems. Do NOT nitpick style, naming conventions, minor formatting, or subjective preferences — only flag issues that could break functionality or cause real harm in production."
 ```
-For example, with both configured the body starts with `@claude @codex review.`; with only Codex it starts with `@codex review.`. Run via `Bash` with `dangerouslyDisableSandbox: true`. Then go to step 5 (wait).
+For example, with both configured the body starts with `@claude @codex review PR #<PR> at exact head <ROUND_HEAD_SHA>.`. Run via `Bash` with `dangerouslyDisableSandbox: true`. Then go to step 5 (wait).
+
+**Attestation (applied in step 6):** GitHub review objects and inline comments carry a `commit_id`. Step 6 accepts, as *this round's* reviewer output, only **new** objects (`id > floor`) whose `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. (Cloud mode relies on GitHub's own review state for the merge authorization; the skill's review-binding record in step 6 binds the *local* verdict to head+base, not a parallel count-based authorization.)
 
 #### Local — built-in `/review` plus Codex when configured
 
 No bot is pinged and no GitHub wait happens. The **built-in `/review` always runs**; if `@codex` is in the reviewers list (step 0), **Codex also reviews locally, in parallel**, and its findings are merged with `/review`'s before triage. (`@codex`-only still runs `/review` too — local mode always includes Claude; the reviewers list only *adds* Codex.)
 
-**Launch both in parallel, then step 6 collects both:**
+**Launch both in parallel, then step 6 collects both.**
+
+**Attest reviewer invocation to `ROUND_HEAD_SHA` (local).** Local mode is checked out on the PR branch, so the reviewers' input is the local tree — attest the local checkout is exactly `ROUND_HEAD_SHA` before any reviewer runs, and again after they finish. Immediately before **each** reviewer invoke (Codex companion AND `/review`) and again after all reviewers finish, run these checks in one bash:
+```bash
+test "$(git rev-parse HEAD)" = "$ROUND_HEAD_SHA" || { echo "Local HEAD != ROUND_HEAD_SHA; discard round."; exit 1; }   # Bash, dangerouslyDisableSandbox: true
+test -z "$(git status --porcelain --untracked-files=all)" || { echo "Working tree dirty; discard round."; exit 1; }
+```
+Any mismatch before an invoke → do **not** invoke that reviewer; discard the round and stop or restart step 4. Any mismatch after the reviewers finish → ignore all local results from this round and stop or restart step 4. Tag each accepted local reviewer result `reviewed_sha: ROUND_HEAD_SHA`. (These checks attest the launch decision; they do not sandbox or redesign the vendor reviewer. Base-binding is re-verified from the GitHub PR object in step 6 before persisting — local refs can drift, so the authoritative base is `gh pr view`, not the local checkout.)
 
 1. **Start Codex first (background) when `@codex` is configured**, so it runs while `/review` works:
    - **Resolve the companion path from the installed-plugins manifest — never hardcode the source namespace or path layout.** `~/.claude/plugins/installed_plugins.json` is the canonical plugin→installPath index (`{ "version": 2, "plugins": { "<name>@<marketplace>": [{ installPath, version, scope, projectPath, lastUpdated, ... }] } }`). Filter carefully, because the chosen script runs with `dangerouslyDisableSandbox: true` (network) — a wrong pick can execute an unrelated plugin impersonating the reviewer:
@@ -251,10 +294,7 @@ No bot is pinged and no GitHub wait happens. The **built-in `/review` always run
      If `$COMPANION` is empty, the codex plugin is **not installed** at user scope (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 6.
 
      > Why not `${CLAUDE_PLUGIN_ROOT}`? That env var is substituted by Claude Code only inside the *owning* plugin's commands/hooks — in a cycle-review session it points at cycle-review (or is unset), so it can't address a sibling plugin. `installed_plugins.json` is the only cross-plugin source of truth for install paths.
-   - **Get the PR's base ref** (this is what makes `--base` equal the PR diff, since local mode is checked out on the PR branch):
-     ```bash
-     BASE=$(gh pr view <PR> --json baseRefName -q .baseRefName)   # Bash, dangerouslyDisableSandbox: true
-     ```
+   - **Base for the review is the round's immutable base SHA** (`ROUND_BASE_SHA` from step 4) — pass that, **not** the mutable branch name. The companion resolves `--base` via local `git merge-base`/`git diff`, so a mutable name (e.g. `main`) would let a stale local ref review the wrong diff while the record stores the current remote base SHA.
    - **Detect dev mode (codex-fork) from the resolved path**, then build the optional `--model`/`--effort` flags from config + per-run override. Dev mode is on when the companion path contains a `-fork/` segment:
      ```bash
      CODEX_FORK=false
@@ -272,7 +312,7 @@ No bot is pinged and no GitHub wait happens. The **built-in `/review` always run
      `CODEX_FLAGS` is left empty on upstream codex (`CODEX_FORK=false`) and when no model/effort is configured — the companion then uses its own defaults (the pre-dev-mode behavior). Values are not re-validated here; the companion validates `--model`/`--effort` itself and a bad value surfaces as stderr → step 6 fail-closed.
    - **Invoke the companion in the background, JSON output, against the PR base:**
      ```bash
-     node "$COMPANION" adversarial-review --wait --json --base "$BASE" $CODEX_FLAGS \
+     node "$COMPANION" adversarial-review --wait --json --base "$ROUND_BASE_SHA" $CODEX_FLAGS \
        "Critical-only review of PR #<PR>: bugs, security vulnerabilities, logical errors, data-loss risks, performance problems. Do NOT nitpick style, naming, formatting, or subjective preferences."
      ```
      Run via **`Bash` with `run_in_background: true`** *and* `dangerouslyDisableSandbox: true` (Codex needs network). `--wait` keeps it blocking *inside* the backgrounded bash, so the background handle completes only when Codex is done. Record the returned background shell id.
@@ -360,16 +400,14 @@ There is no per-reviewer status, no state file, and nothing to resume — each n
 
 #### Fetch comments (cloud mode)
 
-Read all comments and review comments from **all reviewers** (bot and human). Fetch both issue comments and PR review comments:
+Read all comments and review comments from **all reviewers** (bot and human), **attested to this round's `ROUND_HEAD_SHA`**. Review objects and inline comments carry `commit_id`; accept only **new** ones (`id > floor`) with `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. Fetch:
 ```bash
-# Issue comments (Claude edits its single one here):
+# Issue comments (Claude edits its single one here) — no commit_id; findings-only:
 gh api repos/{owner}/{repo}/issues/{PR}/comments --jq '[.[] | {id, user: .user.login, body, created_at}]'
-# PR review objects — body/state/author (Codex posts its review summary here):
-gh pr view <PR> --json reviews --jq '.reviews'
-# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and
-# Claude's inline notes) post actionable issues HERE, and `gh pr view --json reviews`
-# does NOT return them. Miss this surface and a real FIX is silently skipped before merge:
-gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq '[.[] | {id, user: .user.login, path, line, body, created_at}]'
+# PR review objects attested to ROUND_HEAD_SHA (Codex posts its review summary here). Accept only id > ROUND_REVIEW_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
+gh api repos/{owner}/{repo}/pulls/{PR}/reviews --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_REVIEW_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha) and (.state != "PENDING")) | {id, user: .user.login, state, commit_id, body}]'
+# PR INLINE review comments — line-level findings on the diff. CRITICAL: Codex (and Claude's inline notes) post actionable issues HERE, and the review-objects fetch above does NOT return them. Attest: id > ROUND_INLINE_ID_FLOOR and commit_id == ROUND_HEAD_SHA:
+gh api repos/{owner}/{repo}/pulls/{PR}/comments --jq --arg sha "$ROUND_HEAD_SHA" --argjson floor "$ROUND_INLINE_ID_FLOOR" '[.[] | select((.id > $floor) and (.commit_id == $sha)) | {id, user: .user.login, path, line, commit_id, body, created_at}]'
 ```
 Process comments from **all three surfaces** and from every reviewer, not just `claude[bot]`. An inline review comment with an actionable finding is a first-class triage input, exactly like an issue comment.
 
@@ -386,13 +424,13 @@ Launch a **triage** subagent (Agent tool — this is the triage engine, distinct
   - **BEHAVIORAL conclusions** (runtime: "crashes on empty input", "race under X", "off-by-one at boundary", "returns wrong value for Y") — grep confirms the code *looks* that way but does **not** prove it's a bug. Requires a stated **oracle** (spec, invariant, compatibility contract, established behavior) **plus** runtime evidence. Apply the TDD evidence gate below.
 - **Executable evidence gate for BEHAVIORAL claims — conservative execution, not isolation.** A prompt-only skill is **not** a security boundary. A scratch worktree separates files and pins a revision; it does **not** sandbox execution. An allowlisted command name does not make execution safe either — `pytest` may load PR-controlled `conftest.py` and plugins, and repo test runners / build files / package hooks / config may execute arbitrary PR-controlled code.
   - **Before executing any reproducer, make an explicit trust decision.** Treat every repo test command as arbitrary code execution from the PR. Run it only when **all** of these are true:
-    1. The repository and PR provenance are **affirmatively trusted** — e.g. the PR author is you (`@me`), a known collaborator, or otherwise trusted. "No obvious malicious code" is **not** sufficient.
+    1. **The PR is authored by you** (`author == @me`, the authenticated user) — this is the only accepted trust basis; there is no "known collaborator" carve-out. (Local mode is for your own PRs only — step 2 already forced foreign PRs to cloud; this is the secondary check.) **Executable evidence (local reproduction) is for your own PRs only.** For any other PR, do not run a reproducer at all — the behavioral claim is `UNVERIFIED`, which blocks finalization; the PR must be reviewed in **cloud** mode, where the vendor runner executes in its own environment, not on your machine.
     2. Executing arbitrary code from the pinned PR SHA with the current process's ambient filesystem, credentials, and network access would be acceptable.
     3. The PR contains **no** suspicious or unexpected changes to test bootstraps, `conftest.py`, test plugins, runner scripts, build/package hooks, dependency-install paths, or command config.
     4. The reproducer uses only the repo's already-established, allowlisted test command. It requires **no** dependency install, bootstrap script, arbitrary PR-supplied script, elevated privilege, secret, external service, or destructive operation.
     5. Safety does not depend on a filesystem/credential/network/process restriction that this prompt cannot enforce. If a real sandbox would be required to make execution acceptable, do **not** execute.
   - If any condition is false or uncertain → **do not run the reproducer**. Assign **`UNVERIFIED`**, record which trust/execution condition prevented runtime verification, and let the existing `UNVERIFIED` gate stop finalization. **Never** downgrade "can't execute safely" into `HALLUCINATION`.
-  - If execution is permitted: use the scratch worktree only for revision pinning and working-tree separation (create it at the round's `ROUND_SHA` from step 4 — see below). Run **exactly** the allowlisted test command against that pinned SHA, record command + SHA + oracle + result, and clean up the worktree after. Do **not** describe the execution as isolated or sandboxed unless the runtime independently enforces such a boundary.
+  - If execution is permitted: use the scratch worktree only for revision pinning and working-tree separation (create it at the round's `ROUND_HEAD_SHA` from step 4 — see below). Run **exactly** the allowlisted test command against that pinned SHA, record command + SHA + oracle + result, and clean up the worktree after. Do **not** describe the execution as isolated or sandboxed unless the runtime independently enforces such a boundary.
   - Outcomes:
     - A **deterministic red** result against a valid oracle → supports `FIX` (carry the test patch into step 7).
     - A result **positively disproving** the complete claim → `HALLUCINATION`.
@@ -430,21 +468,22 @@ Run via `Bash` with `dangerouslyDisableSandbox: true`. This is the comment the u
 
 #### Decide whether to finalize
 
-**Bind the round to the verified SHA first.** Immediately before declaring the round clean, compare the current PR head with `ROUND_SHA`. If they differ, the whole round is stale — discard the merge-readiness result and restart step 4 against the new head (or stop and report the drift). Only if they match does `ROUND_SHA` become `VERIFIED_SHA`, persisted outside the reviewed repo:
-```bash
-CURRENT_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)   # Bash, dangerouslyDisableSandbox: true
-[ "$CURRENT_SHA" = "$ROUND_SHA" ] || { echo "PR head changed during review: reviewed $ROUND_SHA, current $CURRENT_SHA — restart step 4."; exit 1; }
-REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-STATE_DIR="$HOME/.claude/cycle-review/runs/$REPO_NWO"; STATE_FILE="$STATE_DIR/$PR-verified.json"
-mkdir -p "$STATE_DIR"
-jq -n --argjson pr <PR> --arg sha "$ROUND_SHA" '{pr: $pr, verified_head_sha: $sha}' > "$STATE_FILE"
-```
-Step 11's merge consumes `VERIFIED_SHA` and refuses to merge any other head.
-
 Check these in order (the first two gates are **cloud-only** — they guard against bot silence/outage, which can't happen in local mode where the reviewers report directly):
 - **(cloud only) Step 5 returned `ERROR`** → do NOT finalize. The comments could not be read (a sustained API outage), so an empty triage is meaningless, not approval. Notify the user and stop; never let an outage become a silent merge.
 - **(cloud only) No reviewer was actually heard from this round** → do NOT finalize. If the configured bots posted nothing new for this round (the bots were slow, or Claude shows a usage-limit message instead of a review and no other reviewer responded), then no review happened — "no `FIX` verdicts" only reflects silence, not an approval. Treat a Claude usage-limit message as "Claude did not review" (not a finding). If Codex is configured and reviewed, you may proceed on Codex alone; if nobody reviewed, notify the user and stop. This must be checked BEFORE interpreting the absence of `FIX` verdicts. (In local mode the equivalent is step 4's `/review` fail-closed: if the `Skill` call errored or `/review` produced no review at all, no Claude review happened — stop; if Codex is configured and reviewed, you may proceed on Codex alone.)
-- **No `FIX` and no `UNVERIFIED` verdicts**, and a real review happened (cloud: at least one reviewer reviewed; local: `/review` produced a review and/or Codex reviewed) → this is the **final cycle**. (`UNVERIFIED` blocks finalization just like `FIX` — a behavioral claim we couldn't confirm or refute is not approval.) Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal. Post the replies/summary above for any non-`FIX` comments, then go to **step 9** (final cleanup pass — apply the accumulated minor findings). After step 9: **cloud** proceeds to CI (step 10) + merge (step 11); **local** stops and reports — it does NOT run step 10/11 or merge on its own (see step 11).
+- **No `FIX` and no `UNVERIFIED` verdicts**, and a real review happened (cloud: at least one reviewer reviewed; local: `/review` produced a review and/or Codex reviewed) → this is the **final cycle**. (`UNVERIFIED` blocks finalization just like `FIX` — a behavioral claim we couldn't confirm or refute is not approval.) Do not require an explicit `APPROVED` review state — bot reviewers (e.g. `claude[bot]`) rarely emit it; given a real review, the absence of blocking issues IS the approval signal. **Before declaring final**, re-read the PR and confirm the reviewed snapshot is still intact (author + head + base unchanged since round start — base advancement is normal repo activity and must invalidate the round):
+  ```bash
+  REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)            # Bash, dangerouslyDisableSandbox: true
+  STATE_DIR="$HOME/.claude/cycle-review/runs/$REPO_NWO"; STATE_FILE="$STATE_DIR/$PR-verified.json"; mkdir -p "$STATE_DIR"
+  CURRENT=$(gh pr view <PR> --json author,headRefOid,baseRefName,baseRefOid)
+  jq -e --arg me "$ME" --arg head "$ROUND_HEAD_SHA" --arg bref "$ROUND_BASE_REF" --arg bsha "$ROUND_BASE_SHA" \
+    '(.author.login == $me or $me == "") and (.headRefOid == $head) and (.baseRefName == $bref) and (.baseRefOid == $bsha)' \
+    <<<"$CURRENT" >/dev/null || { rm -f "$STATE_FILE" "$STATE_FILE.tmp"; echo "PR head/base changed during review; restart step 4."; exit 1; }
+  umask 077
+  jq -n --arg author "${ME:-}" --arg head "$ROUND_HEAD_SHA" --arg bref "$ROUND_BASE_REF" --arg bsha "$ROUND_BASE_SHA" \
+    '{author:$author, reviewed_head_sha:$head, reviewed_base_ref:$bref, reviewed_base_sha:$bsha}' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE" || { rm -f "$STATE_FILE" "$STATE_FILE.tmp"; echo "Could not persist review-binding record; stop."; exit 1; }
+  ```
+  (The `$me == ""` / `ME:-""` carve-out keeps cloud mode, where `ME` wasn't resolved, working — author-binding is a local-mode concern.) Post the replies/summary above for any non-`FIX` comments, then go to **step 9** (final cleanup pass — apply the accumulated minor findings). After step 9: **cloud** proceeds to CI (step 10) + merge (step 11); **local** stops and reports — it does NOT run step 10/11 or merge on its own (see step 11).
 - **Any `UNVERIFIED` verdict** → do NOT finalize. The cycle cannot prove or disprove the claim with the evidence it can produce. STOP, report the `UNVERIFIED` finding(s) and what reproducer/environment is missing, and hand back to the user — never let an unresolved behavioral claim look like approval. (This is the additive safety gate: "couldn't reproduce" must not silently clear the PR.)
 - **At least one `FIX`, and this is the 3rd cycle** → STOP, do not start a 4th. Three full review rounds with findings still outstanding means the PR isn't converging on its own — looping further wastes review budget. Notify the user: summarize the still-open `FIX` findings and propose narrowing scope — e.g. move some findings **out of scope** into a follow-up issue/PR so the core change can merge, or have the user rethink the approach. Wait for the user's decision; do not merge and do not auto-loop. (Count a "cycle" as one completed round of steps 4–8, i.e. one review request + triage. The round that produced this 3rd batch of `FIX`s is the 3rd.)
 - **At least one `FIX`, and this is cycle 1 or 2** → proceed to step 7.
@@ -489,11 +528,11 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
 
 4. **Commit and push** (conventional-commits style, e.g. `chore: apply non-blocking review nitpicks before merge`). On the PR, briefly note that the deferred minor findings were applied in `<sha>`.
 
-5. **A cleanup commit invalidates the verified SHA.** If this pass changes or pushes any file, the PR head has moved off `VERIFIED_SHA` — the clean verdict no longer binds to the new head. Remove the verified-SHA state and **return to step 4** for a fresh clean review of the new head (do **not** proceed straight to CI/merge on a post-review commit). If the pass is a genuine no-op (nothing to apply, nothing pushed), retain `VERIFIED_SHA` and proceed:
+5. **A cleanup commit invalidates the review-binding record.** If this pass changes or pushes any file, the PR head has moved off the reviewed `ROUND_HEAD_SHA` — the binding no longer holds. Delete the record **before the first cleanup edit** (not after the push), then make the edits, commit, push, and **return to step 4** for a fresh clean review of the new head (do **not** proceed straight to CI/merge on a post-review commit):
    ```bash
-   rm -f "$STATE_FILE"   # only when this pass pushed a commit
+   rm -f "$STATE_FILE" "$STATE_FILE.tmp"   # before the first cleanup edit, if anything will be changed/pushed
    ```
-   Then: **cloud** proceeds to step 10 (CI) + step 11 (merge) on the retained `VERIFIED_SHA`; **local** stops and reports (no auto-merge). Report to the user the summary of what was fixed across rounds (+ cleanup `<sha>`), and that merge is theirs to trigger.
+   If the pass is a genuine no-op (nothing to apply, nothing pushed), retain the record and proceed. Then: **cloud** proceeds to step 10 (CI) + step 11 (merge) on the retained record; **local** stops and reports (no auto-merge). Report to the user the summary of what was fixed across rounds (+ cleanup `<sha>`), and that merge is theirs to trigger.
 
 If, after re-reading every round, there are genuinely no minor findings to apply (a clean PR that never accrued any `SKIP`/nice-to-have), this step is a no-op — cloud proceeds to step 10; local proceeds to its stop-and-report.
 
@@ -520,20 +559,23 @@ If the same CI check fails more than 2 times after fixes — notify the user and
 
 **Local mode does not merge.** It is review-only on merge by design (the user triggers merge explicitly). After step 9 in local mode, stop and report — do not run the commands below.
 
-Cloud mode: when the PR has no remaining `FIX` verdicts and CI is green, merge **only the verified head**. Load `VERIFIED_SHA` from the state file, re-check the current head matches it, then merge with GitHub CLI's atomic expected-head guard (`--match-head-commit`). If the head drifted since verification, stop and restart review — do **not** merge the substituted commit, and do **not** retry without the guard:
+Cloud mode: when the PR has no remaining `FIX` verdicts and CI is green, merge **only the reviewed head**. Load the review-binding record (author + head + base-ref + base-sha, written in step 6's terminal-success transition), re-read the live PR, and require that **author, head, base-ref, and base-sha all still match the record** — then merge with GitHub CLI's atomic expected-head guard. Any mismatch means the reviewed snapshot is no longer the PR in front of you → stop and re-review, do **not** refresh the stored values, and do **not** retry without the guard:
 ```bash
-REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)            # Bash, dangerouslyDisableSandbox: true
 STATE_FILE="$HOME/.claude/cycle-review/runs/$REPO_NWO/$PR-verified.json"
-VERIFIED_SHA=$(jq -er --argjson pr <PR> 'select(.pr == <PR>) | .verified_head_sha' "$STATE_FILE") \
-  || { echo "No verified PR-head SHA recorded; stop without merging."; exit 1; }
-CURRENT_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)
-[ "$CURRENT_SHA" = "$VERIFIED_SHA" ] || { echo "PR head drifted: verified $VERIFIED_SHA, current $CURRENT_SHA. Restart review."; exit 1; }
-gh pr merge <PR> --squash --delete-branch --match-head-commit "$VERIFIED_SHA"
+VERIFIED=$(jq -er --argjson pr <PR> 'select(.reviewed_head_sha and .reviewed_base_sha) | {head:.reviewed_head_sha, bref:.reviewed_base_ref, bsha:.reviewed_base_sha, author:.author}' "$STATE_FILE") \
+  || { echo "No review-binding record; stop without merging."; exit 1; }
+VERIFIED_HEAD=$(jq -r '.head' <<<"$VERIFIED")
+CURRENT=$(gh pr view <PR> --json author,headRefOid,baseRefName,baseRefOid)
+jq -e --arg head "$VERIFIED_HEAD" --argjson v "$VERIFIED" \
+  '(.headRefOid == $v.head) and (.baseRefName == $v.bref) and (.baseRefOid == $v.bsha) and (($v.author | length == 0) or (.author.login == $v.author))' \
+  <<<"$CURRENT" >/dev/null || { rm -f "$STATE_FILE" "$STATE_FILE.tmp"; echo "PR drifted from reviewed snapshot; re-review."; exit 1; }
+gh pr merge <PR> --squash --delete-branch --match-head-commit "$VERIFIED_HEAD"
 git checkout main
 git pull
-rm -f "$STATE_FILE"
+rm -f "$STATE_FILE" "$STATE_FILE.tmp"
 ```
-If the installed `gh` lacks `--match-head-commit` (`gh pr merge --help` doesn't list it), **stop** — do not fall back to a plain compare-then-merge (that leaves the check-to-merge TOCTOU hole). Upgrade `gh` or merge manually with an equivalent expected-head guard.
+(The `author | length == 0` carve-out skips the author check in cloud mode, where `ME`/`author` weren't resolved.) If the installed `gh` lacks `--match-head-commit` (`gh pr merge --help` doesn't list it), **stop** — do not fall back to a plain compare-then-merge (that leaves the check-to-merge TOCTOU hole). Upgrade `gh` or merge manually with an equivalent expected-head guard.
 
 If the user later asks to merge a PR that was reviewed in local mode, this is the step to run (after confirming CI is green via step 10).
 

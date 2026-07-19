@@ -163,6 +163,24 @@ Uses `gh pr checks --watch` to wait for all checks to finish. If any check fails
 - **Lint & test gate** — runs `ruff` and `pytest` before every push
 - **CI gate** — waits for green CI before merge, debugs failures automatically
 
+## Trust & security boundaries
+
+Local mode is for **your own PRs only** — the skill runs PR-controlled code on your machine (Codex companion, executable reproduction of behavioral findings), which is only acceptable for code you wrote. The check is:
+
+```bash
+ME=$(gh api user --jq .login)                      # who you're authenticated as in gh
+PR_AUTHOR=$(gh pr view <PR> --json author -q .author.login)
+[ "$PR_AUTHOR" = "$ME" ] || FORCE_CLOUD            # foreign author → cloud mode
+```
+
+This is the **only** identity signal a prompt-only skill can read. It is **not** a cryptographic guarantee — know what it does and does not cover:
+
+- **Compromised GitHub account.** If your account is compromised, an attacker pushes a PR authored by `@me` — the skill treats it as your own. This is account security, outside the skill's scope.
+- **Spoofed `gh` token.** If someone replaces the `gh` auth token on your machine, `gh api user` returns *their* login, not yours — the skill can't tell. This is OS/environment security, outside the skill's scope.
+- **Org member / collaborator vs owner.** `author.login` is the PR's author, not a "trusted contributor" judgment. A PR from your org collaborator has `author != @me` → the skill sends it to cloud. This is **conservative** (safer), but may be more cautious than you need for a trusted org.
+
+**Final merge authorization is the platform's job, not the skill's.** The skill's layers (own-PR-only local mode, head+base review binding, `gh pr merge --match-head-commit`) are **best-effort**, not authoritative — a prompt-only skill can't provide atomic authorization (no per-PR locks, no sandbox, ABA on local samples is unfixable by instruction). For real atomicity, enable **GitHub branch protection / merge queue / required reviews on the exact head SHA**. The skill binds its verdict to head+base and refuses to merge a drifted PR, but the authoritative boundary is GitHub.
+
 ## License
 
 MIT

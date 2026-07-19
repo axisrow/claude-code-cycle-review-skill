@@ -1,7 +1,7 @@
 {
   "name": "cycle-review",
   "description": "Automated PR review cycle — request review, fix issues, repeat until approved, then merge. Cloud (GitHub bots) or local (built-in /review via the Skill tool, plus Codex companion when @codex is configured) review mode.",
-  "version": "0.4.10",
+  "version": "0.4.11",
   "author": {
     "name": "axisrow"
   },
