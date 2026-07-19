@@ -126,11 +126,13 @@ The `@codex` bot login is a best-effort default and can vary by integration. On 
 
 ### 2. Multi-PR strategy (run once per invocation)
 
-**Ownership gate (runs before any PR-controlled code executes).** The trust predicate throughout the skill is **ownership** (`author == @me`), NOT review mode — cloud is the default and legitimately reviews your own PRs, so mode is not a trust signal. For **each** PR, resolve ownership once; the rest of the skill (steps 3/4/6/7/9/10) gates local execution on it:
+**Ownership gate (runs before any PR-controlled code executes).** The trust predicate throughout the skill is **ownership** (`author == @me`), NOT review mode — cloud is the default and legitimately reviews your own PRs, so mode is not a trust signal. For **each** PR, resolve ownership once; the rest of the skill (steps 3/4/6/7/9/10) gates local execution on it. **Fail-closed**: if either lookup fails or returns empty (auth/rate-limit/outage), `OWN_PR` defaults to `false` — never `true` on missing data:
 ```bash
+set -euo pipefail
 ME=$(gh api user --jq .login)                                            # Bash, dangerouslyDisableSandbox: true
 PR_AUTHOR=$(gh pr view <PR> --json author -q .author.login)
-if [ "$PR_AUTHOR" = "$ME" ]; then OWN_PR=true; else OWN_PR=false; fi
+test -n "$ME" && test -n "$PR_AUTHOR" || { echo "Could not resolve author/identity (API/auth failure); treating as foreign (OWN_PR=false)."; OWN_PR=false; }
+[ "$PR_AUTHOR" = "$ME" ] && OWN_PR=true || OWN_PR=false
 ```
 Additionally, if `ACTIVE_MODE = local` and `OWN_PR = false`, force this PR's mode to **cloud** (local mode won't run `/review`/Codex/repro on a foreign PR anyway). But note: **a foreign PR in cloud mode still must not have its code executed locally** — steps 3/7/9/10 gate local edits/test/lint/repro/CI-fix on `OWN_PR`, not on mode. `OWN_PR=false` ⇒ no local execution of PR-controlled code anywhere, regardless of mode. `OWN_PR=true` ⇒ local execution is allowed (it's your own code), in whichever mode is active.
 
@@ -397,9 +399,9 @@ There is no per-reviewer status, no state file, and nothing to resume — each n
 
 #### Fetch comments (cloud mode)
 
-Read all comments and review comments from **all reviewers** (bot and human), **attested to this round's `ROUND_HEAD_SHA`**. Review objects and inline comments carry `commit_id`; accept only **new** ones (`id > floor`) with `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. Fetch under `set -o pipefail` so a failed `gh api` aborts instead of being masked by `jq` emitting `[]` and exiting 0 (which would silently drop findings):
+Read all comments and review comments from **all reviewers** (bot and human), **attested to this round's `ROUND_HEAD_SHA`**. Review objects and inline comments carry `commit_id`; accept only **new** ones (`id > floor`) with `commit_id == ROUND_HEAD_SHA`. Issue comments have no `commit_id` — they may supply findings (re-verified against `ROUND_HEAD_SHA`) but **do not count as a reviewer completion**. Fetch under **`set -euo pipefail`** so that a failed `gh api` **aborts the whole triage** (not just sets a non-zero status that later commands ignore). Without `set -e`, `pipefail` alone lets a later successful fetch mask an earlier failure → silently dropped surface → merge authorizes without critical findings:
 ```bash
-set -o pipefail
+set -euo pipefail
 # Issue comments (Claude edits its single one here) — no commit_id; findings-only (paginate; pipe to jq):
 gh api --paginate repos/{owner}/{repo}/issues/{PR}/comments | jq -s '[.[][] | {id, user: .user.login, body, created_at}]'
 # PR review objects attested to ROUND_HEAD_SHA (Codex posts its review summary here). Accept only id > ROUND_REVIEW_ID_FLOOR and commit_id == ROUND_HEAD_SHA (paginate; pipe — gh api does NOT forward jq --arg/--argjson):
