@@ -368,11 +368,21 @@ Check these in order (the first two gates are **cloud-only** — they guard agai
 The cycle counter lives only in your working memory across a long conversation, so make it observable: at the end of every triage, **explicitly state the current cycle number** to the user (e.g. "Triage of cycle 2/3 complete: 1 FIX, 2 SKIP"). This keeps the 3-cycle cap self-checkable instead of relying on hidden state.
 
 ### 7. Fix issues
-- Only fix comments with the `FIX` verdict from step 6
-- Read the files referenced in the comments
-- Apply fixes
-- Run linter: `ruff check src/ tests/`
-- Run tests: `pytest tests/ -v`
+
+Only fix comments with the `FIX` verdict from step 6 — and fix them **properly**, not as throwaway patches. Each `FIX` is a bug; treat it as one and run a real bug-fix pipeline, not "edit until it looks right".
+
+For **each** `FIX` verdict, in turn:
+
+1. **Reproduce it first (test-first).** Before touching production code, write a test that **fails** because of the bug — the test must encode the reviewer's claim (read the file/line, confirm the claim in step 6 already verified it's real) and turn red on the current code. Run it and confirm it fails **for the right reason** (the bug), not for a setup/import error. If the repo has no test framework or the bug genuinely can't be reproduced by a test (e.g. a doc-only issue, an architectural concern, a cross-process/race bug with no test seam) — note that explicitly and fall through to the direct fix below, but do not skip the test by default.
+2. **Minimal fix.** Make the smallest change that turns the red test green. No refactors, no "while I'm here" edits, no scope creep — the diff must address the bug and nothing else. (Cosmetic/nice-to-have items are `SKIP`s, handled in step 9, not here.)
+3. **Green.** Run the new test plus the **full** suite. The new test passes; nothing else regressed. If a pre-existing test now fails, that's a signal the fix is wrong or too broad — narrow it, don't loosen the test.
+4. **Mutation check.** Revert the fix mentally / tweak it: would the test still pass if the fix were subtly wrong (off-by-one, wrong condition, fixed the symptom not the cause)? If yes, strengthen the test until a wrong fix would fail it. The test must actually guard the bug, not just happen to pass.
+5. **Lint.** Run the repo's linter (`ruff check src/ tests/` or the repo's equivalent) on the changed files; fix any lint the fix introduced.
+
+**When test-first isn't possible** (step 1 fallback): make the direct fix, but say *why* no test was added (e.g. "doc-only", "no test seam for this race"), and still run the full suite + lint so the change doesn't silently break something. A `FIX` shipped without a reproducing test is the exception and must be justified inline, not the default.
+
+Only after every `FIX` is fixed this way does the round proceed to step 8 (commit + push). The linter/test commands above are the same ones step 8 will run before committing — don't duplicate; just keep them green.
+
 
 ### 8. Commit and push
 - Commit fixes with a meaningful message (conventional commits style)
