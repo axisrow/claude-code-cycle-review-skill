@@ -194,6 +194,13 @@ Run this **once per PR, before step 4** — do NOT ask the bots to review a half
 
 ### 4. Request review
 
+**Bind this review round to one PR-head SHA.** Before requesting or running any reviewer, capture the full head OID — all review collection, static verification, scratch-worktree reproduction, and triage in this round apply **only** to this SHA:
+```bash
+ROUND_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)   # Bash, dangerouslyDisableSandbox: true
+test -n "$ROUND_SHA" || { echo "Could not resolve PR head SHA; stop."; exit 1; }
+```
+Create any scratch worktree at exactly `ROUND_SHA`; do not resolve a newer SHA per-finding.
+
 **Branch on the active mode (step 1).**
 
 **Cloud:** ping the configured bots. **Local:** run the built-in `/review` (plus Codex when `@codex` is configured). In both modes, launch everything that runs in parallel up front, then step 5 waits (cloud) or step 6 collects (local).
@@ -377,16 +384,22 @@ Launch a **triage** subagent (Agent tool — this is the triage engine, distinct
 - **Verify every claim before assigning `FIX`** — and pick the verification tool that matches the claim's type. Triage behavior is unchanged from before (every finding is still verified); this just adds a TDD/mutation tool for the cases where grep alone can't decide. Decompose each finding into:
   - **FACTUAL premises** (state of the repo: "function doesn't exist", "operator is `==`", "import missing", "line N is X") — decidable from Read/Grep/static tooling. Confirm or refute by reading the code. A true factual premise is **not by itself a defect** — also identify the violated contract/invariant/reachable impact. If a material factual claim is demonstrably false → `HALLUCINATION`.
   - **BEHAVIORAL conclusions** (runtime: "crashes on empty input", "race under X", "off-by-one at boundary", "returns wrong value for Y") — grep confirms the code *looks* that way but does **not** prove it's a bug. Requires a stated **oracle** (spec, invariant, compatibility contract, established behavior) **plus** runtime evidence. Apply the TDD evidence gate below.
-- **TDD evidence gate for BEHAVIORAL claims.** Attempt an executable reproduction, with two hard safety rules:
-  - **Pin to the PR's immutable head SHA.** Resolve the target PR's head SHA (`gh pr view <PR> --json headRefOid -q .headRefOid`) and create the scratch worktree **at exactly that SHA** (`git worktree add --detach <scratch-dir> <head-sha>`). Record the SHA with the evidence. **Before applying any verdict**, re-read the PR head and confirm it is unchanged — if it moved, the reproduction is stale: discard it and re-run or mark `UNVERIFIED`. (Multi-PR runs check out main between merges; never let the reproduction run against main or another PR — the result would be invalid evidence, and a real defect absent from that revision could be mislabeled `HALLUCINATION`.)
-  - **Isolate the execution — a worktree is not a sandbox.** Reproductions may run code from the PR, which can be hostile. Run only the repo's **allowlisted** test command(s) (`pytest`/`ruff`/the repo's own test runner — never an arbitrary reproducer script from the PR). No credentials, no network, home read-only, only the scratch tree writable, and a strict time/resource bound. If reproducing the claim would need secrets, network, or an external service the sandbox can't safely provide → **`UNVERIFIED`** (do **not** run it).
+- **Executable evidence gate for BEHAVIORAL claims — conservative execution, not isolation.** A prompt-only skill is **not** a security boundary. A scratch worktree separates files and pins a revision; it does **not** sandbox execution. An allowlisted command name does not make execution safe either — `pytest` may load PR-controlled `conftest.py` and plugins, and repo test runners / build files / package hooks / config may execute arbitrary PR-controlled code.
+  - **Before executing any reproducer, make an explicit trust decision.** Treat every repo test command as arbitrary code execution from the PR. Run it only when **all** of these are true:
+    1. The repository and PR provenance are **affirmatively trusted** — e.g. the PR author is you (`@me`), a known collaborator, or otherwise trusted. "No obvious malicious code" is **not** sufficient.
+    2. Executing arbitrary code from the pinned PR SHA with the current process's ambient filesystem, credentials, and network access would be acceptable.
+    3. The PR contains **no** suspicious or unexpected changes to test bootstraps, `conftest.py`, test plugins, runner scripts, build/package hooks, dependency-install paths, or command config.
+    4. The reproducer uses only the repo's already-established, allowlisted test command. It requires **no** dependency install, bootstrap script, arbitrary PR-supplied script, elevated privilege, secret, external service, or destructive operation.
+    5. Safety does not depend on a filesystem/credential/network/process restriction that this prompt cannot enforce. If a real sandbox would be required to make execution acceptable, do **not** execute.
+  - If any condition is false or uncertain → **do not run the reproducer**. Assign **`UNVERIFIED`**, record which trust/execution condition prevented runtime verification, and let the existing `UNVERIFIED` gate stop finalization. **Never** downgrade "can't execute safely" into `HALLUCINATION`.
+  - If execution is permitted: use the scratch worktree only for revision pinning and working-tree separation (create it at the round's `ROUND_SHA` from step 4 — see below). Run **exactly** the allowlisted test command against that pinned SHA, record command + SHA + oracle + result, and clean up the worktree after. Do **not** describe the execution as isolated or sandboxed unless the runtime independently enforces such a boundary.
   - Outcomes:
-    - **Reproduces** (red on the pinned PR-head code, for the right reason, against a real oracle, within the allowlisted sandbox) → supports `FIX`; carry the test patch into step 7 as its reproducing test.
-    - **Fails, and the attempted environment/inputs cover the claim and positively disprove it** → `HALLUCINATION`.
-    - **Fails but does NOT positively disprove the claim** (no deterministic test seam; needs prod-only dep, permissions, version skew, fake clock, fault injection, or a test DB the sandbox can't safely provide) → `UNVERIFIED` — record what reproducer/environment is missing. **Never** turn "couldn't reproduce" into `HALLUCINATION` by default — `HALLUCINATION` is reserved for a material claim that is *demonstrably false* (positive disproof), not for "we couldn't reproduce it".
-    - A red test **alone doesn't prove a bug** — a test can be made red by encoding the reviewer's wrong expectation. Require the oracle + a violated contract before `FIX`, not just a failing test. (Guards against mutating correct code to satisfy a hallucinated test.)
-  - **When TDD doesn't apply** (textual/docs/style/naming/architecture findings with no executable acceptance criterion, or a repo with no test framework) — fall back to the factual/static verification above; do not force a test.
-  - Clean up the scratch worktree (`git worktree remove`) when done, regardless of outcome.
+    - A **deterministic red** result against a valid oracle → supports `FIX` (carry the test patch into step 7).
+    - A result **positively disproving** the complete claim → `HALLUCINATION`.
+    - An **inconclusive** result, an unsafe execution decision, a missing environment, or a missing deterministic test seam → `UNVERIFIED`.
+    - A red test **alone is not proof** of a bug — require both the failing behavior and a violated spec/invariant/compatibility-contract/established-behavior before `FIX`.
+  - **When executable evidence doesn't apply** (textual/docs/style/naming/architecture findings with no executable acceptance criterion, a repo with no test framework, or an untrusted PR where the trust conditions above fail) — fall back to factual/static verification; do not force an execution.
+  - The skill does not configure, emulate, or redesign runtime sandboxing — real isolation belongs to the runtime (per the vendor-mechanic principle in `## Important`). This gate decides only whether executing PR-controlled code is acceptable; otherwise it fails closed as `UNVERIFIED`.
 - Return a list of comments with a verdict: `FIX` (needs fixing), `ALREADY_FIXED` (already resolved), `SKIP` (cosmetic), `IRRELEVANT` (unrelated to this PR), `CONFLICTING` (contradicts previous comments), `HALLUCINATION` (a material claim is demonstrably false), `UNVERIFIED` (claim could not be confirmed or refuted with the evidence the cycle can produce — needs a reproducer/environment it doesn't have)
 
 Triage is still where each gets a `FIX`/`SKIP`/… verdict and where merge-readiness is decided. Treat each finding exactly like a reviewer comment. Codex findings carry `reviewer: codex` and are claim-verified here exactly like bot comments — do not trust Codex's `claim` at face value. `/review` is a single-pass review with NO upstream confidence filtering, so verify each `/review` claim here just as rigorously (LLM reviews hallucinate: non-existent functions, wrong line numbers).
@@ -416,6 +429,17 @@ EOF
 Run via `Bash` with `dangerouslyDisableSandbox: true`. This is the comment the user asked local mode to record before fixing — write it every round, then proceed to fix the `FIX` items.
 
 #### Decide whether to finalize
+
+**Bind the round to the verified SHA first.** Immediately before declaring the round clean, compare the current PR head with `ROUND_SHA`. If they differ, the whole round is stale — discard the merge-readiness result and restart step 4 against the new head (or stop and report the drift). Only if they match does `ROUND_SHA` become `VERIFIED_SHA`, persisted outside the reviewed repo:
+```bash
+CURRENT_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)   # Bash, dangerouslyDisableSandbox: true
+[ "$CURRENT_SHA" = "$ROUND_SHA" ] || { echo "PR head changed during review: reviewed $ROUND_SHA, current $CURRENT_SHA — restart step 4."; exit 1; }
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+STATE_DIR="$HOME/.claude/cycle-review/runs/$REPO_NWO"; STATE_FILE="$STATE_DIR/$PR-verified.json"
+mkdir -p "$STATE_DIR"
+jq -n --argjson pr <PR> --arg sha "$ROUND_SHA" '{pr: $pr, verified_head_sha: $sha}' > "$STATE_FILE"
+```
+Step 11's merge consumes `VERIFIED_SHA` and refuses to merge any other head.
 
 Check these in order (the first two gates are **cloud-only** — they guard against bot silence/outage, which can't happen in local mode where the reviewers report directly):
 - **(cloud only) Step 5 returned `ERROR`** → do NOT finalize. The comments could not be read (a sustained API outage), so an empty triage is meaningless, not approval. Notify the user and stop; never let an outage become a silent merge.
@@ -465,7 +489,11 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
 
 4. **Commit and push** (conventional-commits style, e.g. `chore: apply non-blocking review nitpicks before merge`). On the PR, briefly note that the deferred minor findings were applied in `<sha>`.
 
-5. **Do NOT return to step 4.** This pass does not request another review. **Cloud** proceeds directly to step 10 (CI) and step 11 (merge) — the cleanup commit rides the same CI run. **Local** stops here: it does not run step 10/11 and does not merge. Report to the user that the review cycle is complete (summary of what was fixed across rounds and the cleanup `<sha>`), and that merge is theirs to trigger.
+5. **A cleanup commit invalidates the verified SHA.** If this pass changes or pushes any file, the PR head has moved off `VERIFIED_SHA` — the clean verdict no longer binds to the new head. Remove the verified-SHA state and **return to step 4** for a fresh clean review of the new head (do **not** proceed straight to CI/merge on a post-review commit). If the pass is a genuine no-op (nothing to apply, nothing pushed), retain `VERIFIED_SHA` and proceed:
+   ```bash
+   rm -f "$STATE_FILE"   # only when this pass pushed a commit
+   ```
+   Then: **cloud** proceeds to step 10 (CI) + step 11 (merge) on the retained `VERIFIED_SHA`; **local** stops and reports (no auto-merge). Report to the user the summary of what was fixed across rounds (+ cleanup `<sha>`), and that merge is theirs to trigger.
 
 If, after re-reading every round, there are genuinely no minor findings to apply (a clean PR that never accrued any `SKIP`/nice-to-have), this step is a no-op — cloud proceeds to step 10; local proceeds to its stop-and-report.
 
@@ -492,12 +520,20 @@ If the same CI check fails more than 2 times after fixes — notify the user and
 
 **Local mode does not merge.** It is review-only on merge by design (the user triggers merge explicitly). After step 9 in local mode, stop and report — do not run the commands below.
 
-Cloud mode: when the PR has no remaining `FIX` verdicts and CI is green:
+Cloud mode: when the PR has no remaining `FIX` verdicts and CI is green, merge **only the verified head**. Load `VERIFIED_SHA` from the state file, re-check the current head matches it, then merge with GitHub CLI's atomic expected-head guard (`--match-head-commit`). If the head drifted since verification, stop and restart review — do **not** merge the substituted commit, and do **not** retry without the guard:
 ```bash
-gh pr merge <PR> --squash --delete-branch
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+STATE_FILE="$HOME/.claude/cycle-review/runs/$REPO_NWO/$PR-verified.json"
+VERIFIED_SHA=$(jq -er --argjson pr <PR> 'select(.pr == <PR>) | .verified_head_sha' "$STATE_FILE") \
+  || { echo "No verified PR-head SHA recorded; stop without merging."; exit 1; }
+CURRENT_SHA=$(gh pr view <PR> --json headRefOid -q .headRefOid)
+[ "$CURRENT_SHA" = "$VERIFIED_SHA" ] || { echo "PR head drifted: verified $VERIFIED_SHA, current $CURRENT_SHA. Restart review."; exit 1; }
+gh pr merge <PR> --squash --delete-branch --match-head-commit "$VERIFIED_SHA"
 git checkout main
 git pull
+rm -f "$STATE_FILE"
 ```
+If the installed `gh` lacks `--match-head-commit` (`gh pr merge --help` doesn't list it), **stop** — do not fall back to a plain compare-then-merge (that leaves the check-to-merge TOCTOU hole). Upgrade `gh` or merge manually with an equivalent expected-head guard.
 
 If the user later asks to merge a PR that was reviewed in local mode, this is the step to run (after confirming CI is green via step 10).
 
