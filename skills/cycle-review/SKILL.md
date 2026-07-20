@@ -80,8 +80,8 @@ If a **codex-fork** is the installed codex plugin (the companion path contains a
    Do not free-text-parse either answer; use the structured picker.
 
 4. **Run onboarding — second `AskUserQuestion` (dev mode only).** Only when `CODEX_FORK=true`. One tool call, two questions — each question capped at **four** options (Claude Code's `AskUserQuestion` limit):
-   - **Codex model** (single-select): `spark` / `sol` / `terra` / `luna` (recommended `sol`). Passed to the companion as `--model`.
-   - **Codex effort** (single-select): `medium` / `high` / `xhigh` / `max` (recommended `xhigh`). Passed as `--effort`. (The companion accepts the full set `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`, but the picker offers only the realistic four — the rare values stay reachable via the per-run `--effort` override in step 1.)
+   - **Codex model** (single-select, 4 options): `spark` (gpt-5.3-codex-spark — fast, lightweight) / `sol` (gpt-5.6-sol — biggest, recommended for code review) / `terra` (gpt-5.6-terra — smaller than sol) / `luna` (gpt-5.6-luna — the smallest). Passed to the companion as `--model`.
+   - **Codex effort** (single-select, 4 options): `low` / `medium` / `high` / `xhigh` (recommended `xhigh` — best for adversarial code review). Passed as `--effort`. (The companion accepts the full set `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`, but the picker offers only the realistic four — `max`/`ultra` stay reachable via the per-run `--effort` override in step 1.)
 
    Skip this call entirely when `CODEX_FORK=false` — config gets no `codex_model`/`codex_effort`. (Values are validated by the companion itself; the skill just forwards them. A bad value surfaces as a companion stderr error → step 6 fail-closed.)
 
