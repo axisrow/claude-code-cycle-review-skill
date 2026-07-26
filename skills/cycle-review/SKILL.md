@@ -1,6 +1,7 @@
 ---
 name: cycle-review
 description: Automated PR review cycle — request review, fix issues, repeat until approved, then hand back to you for merge. Cloud mode pings GitHub review bots; local mode reviews with the built-in /review command, plus Codex locally when @codex is configured.
+disable-model-invocation: true
 allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Agent, Skill, AskUserQuestion, BashOutput, Monitor
 argument-hint: "[local|cloud] [pr-numbers...] [onboard]"
 ---
@@ -474,25 +475,32 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 
 In **cloud** mode those replies attach to the bot's existing comments. In **local** mode the findings have no GitHub comment to reply to, so instead **post one summary comment** on the PR recording this round's triage results — the local review is the reviewer of record, so its verdicts must land on the PR. When Codex also ran, attribute each finding to its source (the `Reviewer` column); when `@codex` was not configured, drop that column and the heading's "+ Codex companion".
 
-**Posting the comment is a verified gate, not a soft instruction** — a text "post the comment" is too easy to skip or to satisfy by editing the PR body (`gh pr edit --body`), which is NOT a comment. So: capture the comment id and have `verify-comment.sh` confirm the issue comment actually exists and carries this round's nonce. Local mode has no round nonce yet (step 4 generates one only for cloud pings), so generate it here for the comment marker:
+**Posting the comment is a verified gate, not a soft instruction** — a text "post the comment" is too easy to skip or to satisfy by editing the PR body (`gh pr edit --body`), which is NOT a comment. So: capture the comment id and have `verify-comment.sh` confirm the issue comment actually exists and carries this round's nonce. Local mode has no round nonce yet (step 4 generates one only for cloud pings), so generate it here for the comment marker.
+
+**Build the body as data, not as shell source.** Reviewer titles are untrusted text (derived from PR content) — NEVER paste them into an unquoted heredoc or a double-quoted shell argument, because `$()`, backticks, and newlines in a title would execute or break the shell. Construct the full body as a literal string and pass it via `jq --arg` (treated as data, no expansion), exactly like the review-summary table in step 9. The nonce is inserted as data too — do NOT escape it (an escaped `\$ROUND_NONCE` would land literally and the verifier would return `STALE_NONCE`).
 ```bash
 # Generate (or reuse) the round nonce + start timestamp for the local comment marker.
 ROUND_NONCE="${ROUND_NONCE:-$(uuidgen | tr 'A-Z' 'a-z')}"     # Bash, dangerouslyDisableSandbox: true
 ROUND_START_TS="${ROUND_START_TS:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-SUMMARY_COMMENT_ID=$(gh pr comment <PR> --body "$(cat <<EOF
-## 🔍 Local review (cycle N) — round \$ROUND_NONCE
-Reviewed locally (\`/review\` + Codex companion), no bots pinged.
+# Build the body as DATA via jq --arg — reviewer titles go in as literal values, never as
+# shell source. Type the literal table text below; the nonce is a --arg value (not escaped).
+BODYFILE=$(mktemp)
+jq -n --arg nonce "$ROUND_NONCE" --arg body "$(cat <<'SKILLEOF'
+## 🔍 Local review (cycle N) — round SKILLNONCE
+Reviewed locally (`/review` + Codex companion), no bots pinged.
 
 | Verdict | Reviewer | Finding | Location |
 |---|---|---|---|
 | FIX | claude | <title> | path:line |
 | SKIP | codex | <title> | path:line |
 ...
-EOF
-)" | grep -oE '[0-9]+$')
+SKILLEOF
+)" '{body: ($body | sub("SKILLNONCE"; $nonce))}' > "$BODYFILE"
+SUMMARY_COMMENT_ID=$(gh pr comment <PR> --body "$(jq -r '.body' "$BODYFILE")" | grep -oE '[0-9]+$')
+rm -f "$BODYFILE"
 ```
-The heading MUST include `round $ROUND_NONCE` — `verify-comment.sh` checks the comment body carries that nonce (round-bound, not a reused/old comment). Then immediately verify the comment exists:
+The heading MUST include `round <nonce-value>` — `verify-comment.sh` checks the comment body carries that nonce (round-bound, not a reused/old comment). (The `sub("SKILLNONCE"; $nonce)` places the nonce value into the heading as data.) Then immediately verify the comment exists:
 ```bash
 RESULT=$(REPO_NWO="$REPO_NWO" COMMENT_ID="$SUMMARY_COMMENT_ID" NONCE="$ROUND_NONCE" SINCE="$ROUND_START_TS" \
   bash "<path-to-skill-dir>/verify-comment.sh")   # dangerouslyDisableSandbox: true
