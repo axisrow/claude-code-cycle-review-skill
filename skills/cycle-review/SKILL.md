@@ -173,20 +173,6 @@ Skip the rest of this step only when there is exactly one PR to handle (single-P
 
 5. Multi-PR planning stays — but the skill no longer merges, so the queue is popped only when the **user** merges a PR (manually or via the step-11 recipe on request). After a user merge, return here: pop the merged PR from the queue, recompute file overlap for the rest (the codebase has changed), and continue with the next PR.
 
-### 2.5. Consent gate — authorize this run before any mutation
-
-The skill has no reliable signal for "manual `/command` vs model-auto-invocation" in Claude Code, so this gate is **universal**: before the first edit/commit/push of the run, ask the user for explicit authorization. This is a **behavioral barrier, not a security boundary** (a prompt-only skill cannot enforce one) — it exists to surface the run's effects before mutating the PR.
-
-**What is NOT consent:** typing `/cycle-review`, passing `--yes` or any `ARGUMENTS`, an env var, a tool-permission grant, a phrase from an earlier session, or the model's own decision to invoke the skill. None of these authorize mutation. Only the explicit answer below does.
-
-**Run one `AskUserQuestion`** (single-select, 2 options) once per run, scoped to the resolved PR set + active mode. The question must name the concrete effects:
-- **Question:** "Authorize this cycle-review run? On PR(s) #<list> in `<local|cloud>` mode: edit code, run tests/linter/repro (only PRs you own — `OWN_PR=true`), commit and push to the PR branch, post review/triage comments, watch CI. It will **not** merge (both modes are review-only on merge)."
-- **Options:** `Authorize this run` / `Do not authorize`.
-
-On `Authorize this run` → set `MUTATION_AUTHORIZED=true` (in-memory for this run) and proceed to step 3. On `Do not authorize`, cancel, timeout, or any error from the tool → `MUTATION_AUTHORIZED=false` → **STOP before any mutation**; report that authorization was not granted and do not edit/commit/push.
-
-**Authorization is scoped** to the named PR(s) + the active mode. A new PR entering the queue later (step 2) or a mode switch re-runs this gate. Every later mutation step (3.4, 7, 8, 9, 10 CI-fix) requires `MUTATION_AUTHORIZED=true` — check it before the first edit/commit/push there.
-
 ### 3. Verify the PR implements its linked issue 100% (before any review)
 
 Run this **once per PR, before step 4** — do NOT ask the bots to review a half-finished PR. Review bots check whether the *code* is correct, not whether it is *complete* relative to the issue's design; a PR can be approved by both bots and still ship only half of what the issue asked for. Catch that here, up front, not after a wasted review round (or after merging an incomplete issue).
@@ -208,7 +194,7 @@ Run this **once per PR, before step 4** — do NOT ask the bots to review a half
 
 3. **Confirm each deliverable is actually implemented.** Read the changed code and `grep` the repo to verify every item on that checklist is present in this PR's diff (not merely planned, not "mostly"). A design that lists two markers/flags/outputs and a PR that ships one is a **gap**, even if the shipped half is flawless.
 
-4. **If a gap exists — close it now (before review):** requires `MUTATION_AUTHORIZED=true` (step 2.5) — this is the first possible mutation of the run.
+4. **If a gap exists — close it now (before review):**
    - Implement the missing pieces test-first (write the failing test, then the code), following the repo's conventions.
    - Run the repo's linter and full test suite green.
    - Commit (conventional-commits style) and push to the PR branch.
@@ -486,11 +472,17 @@ Only fix comments with the `FIX` verdict. For other verdicts — leave a reply c
 - `HALLUCINATION` — show concrete evidence from the codebase (grep results, file contents) that disproves the reviewer's claim
 - `UNVERIFIED` — a behavioral claim that couldn't be confirmed or refuted with the evidence the cycle can produce (no deterministic test seam, missing environment/deps). State what reproducer/environment is missing and that the cycle stopped because of it — do **not** treat it as approved.
 
-In **cloud** mode those replies attach to the bot's existing comments. In **local** mode the findings have no GitHub comment to reply to, so instead **post one summary comment** on the PR recording this round's triage results — the local review is the reviewer of record, so its verdicts must land on the PR. When Codex also ran, attribute each finding to its source (the `Reviewer` column); when `@codex` was not configured, drop that column and the heading's "+ Codex companion":
+In **cloud** mode those replies attach to the bot's existing comments. In **local** mode the findings have no GitHub comment to reply to, so instead **post one summary comment** on the PR recording this round's triage results — the local review is the reviewer of record, so its verdicts must land on the PR. When Codex also ran, attribute each finding to its source (the `Reviewer` column); when `@codex` was not configured, drop that column and the heading's "+ Codex companion".
+
+**Posting the comment is a verified gate, not a soft instruction** — a text "post the comment" is too easy to skip or to satisfy by editing the PR body (`gh pr edit --body`), which is NOT a comment. So: capture the comment id and have `verify-comment.sh` confirm the issue comment actually exists and carries this round's nonce. Local mode has no round nonce yet (step 4 generates one only for cloud pings), so generate it here for the comment marker:
 ```bash
-gh pr comment <PR> --body "$(cat <<'EOF'
-## 🔍 Local review (cycle N)
-Reviewed locally (`/review` + Codex companion), no bots pinged.
+# Generate (or reuse) the round nonce + start timestamp for the local comment marker.
+ROUND_NONCE="${ROUND_NONCE:-$(uuidgen | tr 'A-Z' 'a-z')}"     # Bash, dangerouslyDisableSandbox: true
+ROUND_START_TS="${ROUND_START_TS:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+SUMMARY_COMMENT_ID=$(gh pr comment <PR> --body "$(cat <<EOF
+## 🔍 Local review (cycle N) — round \$ROUND_NONCE
+Reviewed locally (\`/review\` + Codex companion), no bots pinged.
 
 | Verdict | Reviewer | Finding | Location |
 |---|---|---|---|
@@ -498,9 +490,20 @@ Reviewed locally (`/review` + Codex companion), no bots pinged.
 | SKIP | codex | <title> | path:line |
 ...
 EOF
-)"
+)" | grep -oE '[0-9]+$')
 ```
-Run via `Bash` with `dangerouslyDisableSandbox: true`. This is the comment the user asked local mode to record before fixing — write it every round, then proceed to fix the `FIX` items.
+The heading MUST include `round $ROUND_NONCE` — `verify-comment.sh` checks the comment body carries that nonce (round-bound, not a reused/old comment). Then immediately verify the comment exists:
+```bash
+RESULT=$(REPO_NWO="$REPO_NWO" COMMENT_ID="$SUMMARY_COMMENT_ID" NONCE="$ROUND_NONCE" SINCE="$ROUND_START_TS" \
+  bash "<path-to-skill-dir>/verify-comment.sh")   # dangerouslyDisableSandbox: true
+case "$RESULT" in
+  VERIFIED\ *) echo "Local triage-summary recorded (comment $SUMMARY_COMMENT_ID).";;
+  *) echo "Local triage-summary NOT recorded (verify-comment.sh: $RESULT). STOP before fixes — do NOT proceed. \
+MISSING = the worker skipped the comment or edited the PR body instead of \`gh pr comment\`; \
+STALE_NONCE/STALE_TIMESTAMP = a reused/old comment."; exit 1;;
+esac
+```
+All `Bash` calls above run with `dangerouslyDisableSandbox: true`. Only after `VERIFIED` do you proceed to fix the `FIX` items — the gate exists precisely because the soft "post the comment" instruction was being skipped.
 
 #### Decide whether to finalize
 
@@ -542,7 +545,7 @@ On **authorize** → run a **targeted** cloud ping to the silent handle only: if
 
 On **do not authorize**, timeout, no cloud bot configured for that handle, the cloud bot itself stays silent, or `OWN_PR=false` → **STOP without re-asking**. Report: which reviewer is silent, the cause, that fallback was offered and declined/unavailable, and that the cycle stopped because approval requires every configured reviewer to answer.
 
-**This fallback authorizes only a ping + wait. It does not authorize edit, push, or merge — those still require `MUTATION_AUTHORIZED=true` (step 2.5) and the normal cycle flow.** Do not flip `ACTIVE_MODE` to cloud; the run stays local except for this one targeted ping.
+**This fallback authorizes only a ping + wait. It does not authorize edit, push, or merge — those still go through the normal cycle flow.** Do not flip `ACTIVE_MODE` to cloud; the run stays local except for this one targeted ping.
 
 - **At least one `FIX`, and this is the 3rd cycle** → STOP, do not start a 4th. The 3-cycle cap exists not as an arbitrary limit but as a **signal**: if you've reached it, the previous fixes likely closed symptoms, not the root cause, and the reviewer keeps finding new variants of the same bug class. **Before handing back to the user, diagnose:**
   - Are the open findings **variants of one root cause**? If so — the previous fixes patched symptoms. Name the **invariant** the bug violates (the violated contract, not the described case), so the user can fix it at the root and close ALL variants at once.
@@ -557,7 +560,7 @@ The cycle counter lives only in your working memory across a long conversation, 
 
 Only fix comments with the `FIX` verdict from step 6 — and fix them **properly**, not as throwaway patches. Each `FIX` is a bug; treat it as one and run a real bug-fix pipeline, not "edit until it looks right".
 
-**Ownership-aware.** This step (and its test/lint runs) is **only for a PR you own** (`OWN_PR=true`) and requires `MUTATION_AUTHORIZED=true` (step 2.5). For a **foreign PR** (`OWN_PR=false`), do **not** edit the PR or run its test suite / linter / reproduction on your machine — `FIX` verdicts on a foreign PR are surfaced to the user (and to the bots in the next cloud round), not applied locally. Fixing someone else's PR locally would execute PR-controlled code with your ambient credentials. (Note: a PR you own in **cloud** mode is still your PR — `OWN_PR=true` — so this step applies normally; ownership, not mode, gates local execution.)
+**Ownership-aware.** This step (and its test/lint runs) is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), do **not** edit the PR or run its test suite / linter / reproduction on your machine — `FIX` verdicts on a foreign PR are surfaced to the user (and to the bots in the next cloud round), not applied locally. Fixing someone else's PR locally would execute PR-controlled code with your ambient credentials. (Note: a PR you own in **cloud** mode is still your PR — `OWN_PR=true` — so this step applies normally; ownership, not mode, gates local execution.)
 
 For **each** `FIX` verdict, in turn:
 
@@ -573,7 +576,6 @@ Only after every `FIX` is fixed this way does the round proceed to step 8 (commi
 
 
 ### 8. Commit and push
-Requires `MUTATION_AUTHORIZED=true` (step 2.5).
 - Commit fixes with a meaningful message (conventional commits style)
 - Push to remote
 - Return to step 4 ONLY if fewer than 3 cycles have run. This begins a **new review round**: **cloud** posts a fresh review request and runs the step-5 waiter again (it always waits a clean fixed window — nothing to reset); **local** re-runs `/review` (step 4) against the now-updated diff, plus Codex if configured. Keep a running count of completed cycles (one cycle = one steps 4–8 round). **Hard cap: 3 cycles.** If the round you just triaged was the 3rd and it still had `FIX` verdicts, do NOT loop again — stop and hand back to the user per the step-6 "3rd cycle" gate (summarize the open findings, propose moving some out of scope into a follow-up issue/PR, or rethinking the approach). The cap only bites when findings persist; a clean 1st or 2nd round finalizes normally.
@@ -590,7 +592,7 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
 
    Explicitly EXCLUDE the verdicts that have nothing to fix: `HALLUCINATION` (claim is false), `IRRELEVANT` (not this PR's code), `CONFLICTING` (contradictory — ask, don't guess), `ALREADY_FIXED` (already done), and `UNVERIFIED` (unresolved — not deferred-cosmetic; it blocked the cycle, it's not a cleanup item). De-dup findings that recurred across rounds by their substance (use `path` + `line` when present, as on Codex inline comments; otherwise the gist of the body — Claude's single issue comment has no path/line), and skip any that a later commit already addressed.
 
-2. **Apply all of them** (requires `MUTATION_AUTHORIZED=true`, step 2.5). Make the edits, keeping each change minimal and faithful to the reviewer's intent. If a suggested change would be risky, change behavior, or contradicts the repo's conventions, do NOT force it — leave a short reply explaining why it was left out (this is the only thing that may remain unfixed).
+2. **Apply all of them.** Make the edits, keeping each change minimal and faithful to the reviewer's intent. If a suggested change would be risky, change behavior, or contradicts the repo's conventions, do NOT force it — leave a short reply explaining why it was left out (this is the only thing that may remain unfixed).
 
 3. **Lint and test green**, same as step 7 (`ruff check src/ tests/`, `pytest tests/ -v` — or the repo's equivalents).
 
@@ -642,7 +644,7 @@ If any check has failed — read the logs of the failed run:
 gh run list --branch <HEAD_BRANCH> --limit 5 --json databaseId,name,status,conclusion --jq '.[] | select(.conclusion == "failure")'
 gh run view <RUN_ID> --log-failed
 ```
-Identify the root cause, apply fixes (requires `MUTATION_AUTHORIZED=true`, step 2.x), commit and push (follow the commit style from step 8), then **return to step 4** for a fresh clean review of the new head — a post-review commit invalidates the review-binding record (as in step 9.5), so the cycle re-reviews and re-watches CI. Repeat until a clean review lands on a green-CI head; then **stop and report** (do not merge — that is the user's action).
+Identify the root cause, apply fixes, commit and push (follow the commit style from step 8), then **return to step 4** for a fresh clean review of the new head — a post-review commit invalidates the review-binding record (as in step 9.5), so the cycle re-reviews and re-watches CI. Repeat until a clean review lands on a green-CI head; then **stop and report** (do not merge — that is the user's action).
 
 **Ownership-aware (do not edit a foreign PR's CI failures locally).** Applying CI fixes — editing code, running the repo's test suite/linter (the global pre-commit rule), committing, pushing — is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), do **not** edit/test/commit locally: surface the CI failure to the user (and re-run the bots), do not fix someone else's CI failure on your machine. If a foreign PR's CI can't go green, stop and hand back to the user.
 
@@ -679,7 +681,7 @@ If a multi-PR queue was built in step 2 and the user has merged a PR (via this r
 - **Built-in review mechanics are vendor-supported — don't redesign them.** Claude Code's built-in `/review` and the codex companion's `review`/`adversarial-review` are maintained by their vendors (Anthropic / the codex-fork maintainer). The skill **consumes** their findings and triages them like any reviewer comment — it does **not** alter, override, or re-implement how those reviewers work, what they flag, or how confident they are. If a vendor reviewer's behavior needs changing, that's an upstream issue (e.g. codex-plugin-cc), not a cycle-review change. The TDD/mutation verification in step 6 is *our triage tool*, applied to the findings we receive — never a prescription for how the vendor reviewers should behave.
 - **Two modes (step 1).** `cloud` (default) pings GitHub bots; `local` reviews with the built-in `/review` command (no bot ping, no GitHub wait). **Both modes are review-only on merge** — each loops triage→reply/summary→fix→commit→push, watches CI (step 10, read-only), auto-fixes a red CI in a PR you own, then stops and reports. The skill never merges; a manual-merge recipe lives in step 11 for an explicit user request. A leading `local`/`cloud` flag overrides the saved `mode`; with neither, default to cloud. In local mode `/review` always runs; if `@codex` is in the reviewers list, Codex also reviews locally (companion script, in parallel, findings merged).
 - **Approval requires every configured reviewer to answer — silence is never approval (root invariant).** If **any** configured reviewer does not return a verdict this round — for ANY reason (not installed, not logged in, 503/upstream-outage, usage-limit, timeout, empty parse, "aliens") — it is silent, and silence is not approval. The cycle **retries the round up to 2 times, then STOPS and reports** (step 6); it does **not** fall back to the other reviewer alone, does **not** finalize, and does **not** tell the user the PR is ready/mergeable. The same ALL-configured rule applies in cloud: every configured bot must be heard from, round-bound — one bot approving while the other is silent is not approval.
-- **Local review records its verdicts on the PR.** Because there is no bot comment to reply to, local mode posts one triage-summary comment per round before fixing (step 6), so the PR has a durable record of what the local reviewer found.
+- **Local review records its verdicts on the PR — and that comment is programmatically verified.** Because there is no bot comment to reply to, local mode posts one triage-summary comment per round before fixing (step 6). The worker must capture the comment id and run `verify-comment.sh` (beside this `SKILL.md`), which confirms via the GitHub API that an **issue comment** with this round's nonce really exists (a `gh pr edit --body` PR-body edit, or a skipped comment, fails the gate as `MISSING`). Only `VERIFIED` lets the cycle proceed to fixes.
 - **Codex review progress is streamed, not waited on silently (local).** Step 4 launches Codex with `run_in_background: true` + `--wait` and records the shell id (`$CODEX_SHELL_ID`); a `Monitor` (now in `allowed-tools`, alongside `BashOutput`) tails the shell's stderr every ~10s and prints the live `[codex]` progress to the user — you see the review happen, no silent background wait — then collects the final JSON + exit code once the shell exits.
 - All `gh` commands (and any other GitHub API calls) must be run via Bash with `dangerouslyDisableSandbox: true`, as the sandbox blocks TLS connections to api.github.com.
 - Every commit must have a meaningful message following conventional commits style.
