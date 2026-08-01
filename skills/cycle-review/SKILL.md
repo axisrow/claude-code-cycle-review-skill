@@ -34,7 +34,7 @@ The skill has **two review modes**. Pick the active one in step 1 before anythin
 
 ## Cycle
 
-Run step 0 (onboarding) and step 1 (resolve mode) once at the start of every invocation. Then, for each PR, run step 3 (verify the PR implements its linked issue 100% — fix any gap BEFORE asking for review), repeat steps 4–8 until the PR has no `FIX` verdicts — **but no more than 3 cycles**; if a 3rd cycle still has `FIX`s, stop and hand back to the user to narrow scope. Once a round is clean, run step 9 (final cleanup pass — apply the minor findings deferred across all earlier rounds). Then **both modes** run step 10 (CI — read-only `gh pr checks --watch`, auto-fix a red CI in your own PR) and **stop and report** (the skill never merges; merge is a user action — see the manual-merge recipe in step 11).
+Run step 0 (onboarding) and step 1 (resolve mode) once at the start of every invocation. Then, for each PR, run step 3 (verify the PR implements its linked issue 100% — fix any gap BEFORE asking for review), repeat steps 4–8 until the PR has no `FIX` verdicts — **but no more than 3 cycles**; if a 3rd cycle still has `FIX`s, stop and hand back to the user to narrow scope. Deferred minor findings (`SKIP`/nice-to-have) are applied **inside step 7**, alongside that round's `FIX`es, so they never trail a clean round. Once a round is clean, run step 9 — **normally a no-op final gate**: it re-checks for any *still-unapplied* deferred finding (there usually isn't one, since step 7 already applied them) and posts the roll-up summary. Only if something genuinely slipped through does step 9 apply it, and that triggers one bounded re-review of the same cycle (not a new cycle — see step 8). Then **both modes** run step 10 (CI — read-only `gh pr checks --watch`, auto-fix a red CI in your own PR) and **stop and report** (the skill never merges; merge is a user action — see the manual-merge recipe in step 11).
 
 ### 0. Onboarding — reviewers + default mode (optional, run once per invocation)
 
@@ -539,7 +539,7 @@ Check these in order. The first gate is the **silence gate** (both modes) — it
   jq -n --arg author "${ME:-}" --arg head "$ROUND_HEAD_SHA" --arg bref "$ROUND_BASE_REF" --arg bsha "$ROUND_BASE_SHA" \
     '{author:$author, reviewed_head_sha:$head, reviewed_base_ref:$bref, reviewed_base_sha:$bsha}' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE" || { rm -f "$STATE_FILE" "$STATE_FILE.tmp"; echo "Could not persist review-binding record; stop."; exit 1; }
   ```
-  (The `$me == ""` / `ME:-""` carve-out keeps cloud mode, where `ME` wasn't resolved, working — author-binding is a local-mode concern.) Post the replies/summary above for any non-`FIX` comments, then go to **step 9** (final cleanup pass — apply the accumulated minor findings). After step 9: **both modes** proceed to step 10 (CI watch, read-only; auto-fix a red CI in a PR you own), then **stop and report** — the cycle does not merge (see the step 11 manual recipe).
+  (The `$me == ""` / `ME:-""` carve-out keeps cloud mode, where `ME` wasn't resolved, working — author-binding is a local-mode concern.) Post the replies/summary above for any non-`FIX` comments, then go to **step 9** (final gate — normally a no-op, since the deferred minor findings were already applied in step 7; posts the roll-up summary). After step 9: **both modes** proceed to step 10 (CI watch, read-only; auto-fix a red CI in a PR you own), then **stop and report** — the cycle does not merge (see the step 11 manual recipe).
 - **Any `UNVERIFIED` verdict** → do NOT finalize. The cycle cannot prove or disprove the claim with the evidence it can produce. STOP, report the `UNVERIFIED` finding(s) and what reproducer/environment is missing, and hand back to the user — never let an unresolved behavioral claim look like approval.
 - **A configured reviewer is silent (silence gate failed) → retry the round up to 2 times, then STOP.** A silent reviewer is often transient (a 503 blip, throttling, a slow bot). So before handing back to the user, re-run the review round (step 4: re-ping the bots / re-run `/review` + Codex) up to **2** times total, re-checking the silence gate each round. If the silent reviewer comes back — proceed normally (triage the merged findings). If, after 2 retries, a configured reviewer is **still** silent: before STOP, if `ACTIVE_MODE=local` and `OWN_PR=true`, offer the **user-gated cloud fallback** in step 6.x (one targeted ping to the silent handle; never automatic). Otherwise **STOP — do NOT finalize, do NOT propose merge, do NOT tell the user "all clear" / "ready to merge".** Report to the user: which reviewer is silent, the observed cause (503 / usage-limit / timeout / unknown), how many rounds were tried, and that the cycle stopped because approval requires **every** configured reviewer to answer. The user then decides: retry later (when the upstream recovers), re-onboard to drop the silent reviewer from the config and re-run with the rest, or defer.
 
@@ -564,9 +564,9 @@ On **do not authorize**, timeout, no cloud bot configured for that handle, the c
   Tell the user: why the 3-cycle rule fired, what was diagnosed (invariant violation or design contradiction), and propose — fix the invariant at the root, simplify the design, or move some findings **out of scope** into a follow-up issue/PR. Wait for the user's decision; do not merge and do not auto-loop. (Count a "cycle" as one completed round of steps 4–8, i.e. one review request + triage. The round that produced this 3rd batch of `FIX`s is the 3rd.)
 - **At least one `FIX`, and this is cycle 1 or 2** → proceed to step 7.
 
-The cycle counter lives only in your working memory across a long conversation, so make it observable: at the end of every triage, **explicitly state the current cycle number** to the user (e.g. "Triage of cycle 2/3 complete: 1 FIX, 2 SKIP"). This keeps the 3-cycle cap self-checkable instead of relying on hidden state.
+The cycle counter lives only in your working memory across a long conversation, so make it observable: at the end of every triage, **explicitly state the current cycle number** to the user (e.g. "Triage of cycle 2/3 complete: 1 FIX, 2 SKIP"). This keeps the 3-cycle cap self-checkable instead of relying on hidden state. When a round is instead a re-review (step 8's "cycles vs. re-reviews" rule — triggered by step 9 or step 10, not by a `FIX`), say so explicitly too (e.g. "re-review of cycle 2 after cleanup commit — not cycle 3") so the user can tell real review cycles apart from head-revalidation passes.
 
-### 7. Fix issues
+### 7. Fix issues (+ apply deferred minor findings)
 
 Only fix comments with the `FIX` verdict from step 6 — and fix them **properly**, not as throwaway patches. Each `FIX` is a bug; treat it as one and run a real bug-fix pipeline, not "edit until it looks right".
 
@@ -575,28 +575,18 @@ Only fix comments with the `FIX` verdict from step 6 — and fix them **properly
 For **each** `FIX` verdict, in turn:
 
 1. **Reproduce it first (test-first).** If step 6 already produced a confirmed reproducing test for this `FIX` (behavioral claim, reproduced in the scratch worktree), **reuse it** — re-apply to the production tree and confirm it still fails for the right reason. Otherwise write a test that **fails** because of the bug — the test must encode the reviewer's claim (read the file/line, confirm the claim in step 6 already verified it's real) and turn red on the current code. Run it and confirm it fails **for the right reason** (the bug), not for a setup/import error. If the repo has no test framework or the bug genuinely can't be reproduced by a test (e.g. a doc-only issue, an architectural concern, a cross-process/race bug with no test seam) — note that explicitly and fall through to the direct fix below, but do not skip the test by default.
-2. **Minimal fix.** Make the smallest change that turns the red test green. No refactors, no "while I'm here" edits, no scope creep — the diff must address the bug and nothing else. (Cosmetic/nice-to-have items are `SKIP`s, handled in step 9, not here.)
+2. **Minimal fix.** Make the smallest change that turns the red test green. No refactors, no "while I'm here" edits, no scope creep — the diff must address the bug and nothing else. (Cosmetic/nice-to-have items are `SKIP`s, handled by the deferred-findings pass below, not here.)
 3. **Green.** Run the new test plus the **full** suite. The new test passes; nothing else regressed. If a pre-existing test now fails, that's a signal the fix is wrong or too broad — narrow it, don't loosen the test.
 4. **Mutation check.** Revert the fix mentally / tweak it: would the test still pass if the fix were subtly wrong (off-by-one, wrong condition, fixed the symptom not the cause)? If yes, strengthen the test until a wrong fix would fail it. The test must actually guard the bug, not just happen to pass.
 5. **Lint.** Run the repo's linter (`ruff check src/ tests/` or the repo's equivalent) on the changed files; fix any lint the fix introduced.
 
 **When test-first isn't possible** (step 1 fallback): make the direct fix, but say *why* no test was added (e.g. "doc-only", "no test seam for this race"), and still run the full suite + lint so the change doesn't silently break something. A `FIX` shipped without a reproducing test is the exception and must be justified inline, not the default.
 
-Only after every `FIX` is fixed this way does the round proceed to step 8 (commit + push). The linter/test commands above are the same ones step 8 will run before committing — don't duplicate; just keep them green.
+#### Apply deferred minor findings in the same round
 
+Right after every `FIX` is fixed (and only if this round had at least one `FIX` — a fully clean round has nothing pending here, see step 9), apply the minor findings accumulated across earlier rounds **in this same commit/push**, so cosmetic cleanup never trails behind a clean round and never triggers an extra review round on its own:
 
-### 8. Commit and push
-- Commit fixes with a meaningful message (conventional commits style)
-- Push to remote
-- Return to step 4 ONLY if fewer than 3 cycles have run. This begins a **new review round**: **cloud** posts a fresh review request and runs the step-5 waiter again (it always waits a clean fixed window — nothing to reset); **local** re-runs `/review` (step 4) against the now-updated diff, plus Codex if configured. Keep a running count of completed cycles (one cycle = one steps 4–8 round). **Hard cap: 3 cycles.** If the round you just triaged was the 3rd and it still had `FIX` verdicts, do NOT loop again — stop and hand back to the user per the step-6 "3rd cycle" gate (summarize the open findings, propose moving some out of scope into a follow-up issue/PR, or rethinking the approach). The cap only bites when findings persist; a clean 1st or 2nd round finalizes normally.
-
-### 9. Final cleanup pass (last cycle — apply the accumulated minor findings)
-
-Reached only on the **final cycle** — when a round has no `FIX` verdicts (step 6) and a real review happened (silence gate passed — step 6 stops the cycle before here if any reviewer is still silent). Before finalizing, spend this one pass cleaning up everything that was correct-but-not-blocking and was therefore deferred across the earlier rounds, so nothing useful is left on the table.
-
-**Ownership-aware.** Applying cleanup edits (and running the test suite/linter) is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), this step is a **no-op**: do not edit the PR or run its tests/linter locally — the accumulated `SKIP`/nice-to-have findings are surfaced to the user and the bots, not applied on your machine.
-
-1. **Gather the minor findings from EVERY previous review round, not just the last one.** Re-read all findings across the whole PR history — **cloud**: all three GitHub surfaces (issue comments, PR reviews, inline review comments — same fetch as step 6); **local**: read each prior round's **per-run findings file** written in step 4.7 (each round's merged `/review` + Codex findings persisted at `${TMPDIR:-/tmp}/cycle-review/<PR>-round<N>.json`), plus any human comments on the PR. For both `/review` and Codex, read only those per-run files — neither is persisted anywhere else. Collect every finding that is real and actionable but was not a `FIX`:
+1. **Gather the minor findings from EVERY previous review round, not just the last one (including this round's own non-`FIX` verdicts).** Re-read all findings across the whole PR history — **cloud**: all three GitHub surfaces (issue comments, PR reviews, inline review comments — same fetch as step 6); **local**: read each prior round's **per-run findings file** written in step 4.7 (each round's merged `/review` + Codex findings persisted at `${TMPDIR:-/tmp}/cycle-review/<PR>-round<N>.json`), plus any human comments on the PR. For both `/review` and Codex, read only those per-run files — neither is persisted anywhere else. Collect every finding that is real and actionable but was not a `FIX`:
    - all `SKIP` (genuine cosmetic/style/naming/minor-improvement findings), and
    - any reasonable nice-to-have the reviewers suggested (e.g. "add a clarifying comment", "rename for clarity", "tidy this helper", "add a migration note") — even when previously deferred as non-blocking.
 
@@ -604,15 +594,35 @@ Reached only on the **final cycle** — when a round has no `FIX` verdicts (step
 
 2. **Apply all of them.** Make the edits, keeping each change minimal and faithful to the reviewer's intent. If a suggested change would be risky, change behavior, or contradicts the repo's conventions, do NOT force it — leave a short reply explaining why it was left out (this is the only thing that may remain unfixed).
 
-3. **Lint and test green**, same as step 7 (`ruff check src/ tests/`, `pytest tests/ -v` — or the repo's equivalents).
+3. **Lint and test green**, folded into the same pass as the `FIX` items above — don't run it twice.
 
-4. **Commit and push** (conventional-commits style, e.g. `chore: apply non-blocking review nitpicks before merge`). On the PR, briefly note that the deferred minor findings were applied in `<sha>`.
+Only after every `FIX` is fixed and every deferred minor finding is applied this way does the round proceed to step 8 (commit + push). The linter/test commands above are the same ones step 8 will run before committing — don't duplicate; just keep them green.
 
-5. **A cleanup commit invalidates the review-binding record.** If this pass changes or pushes any file, the PR head has moved off the reviewed `ROUND_HEAD_SHA` — the binding no longer holds. Delete the record **before the first cleanup edit** (not after the push), then make the edits, commit, push, and **return to step 4** for a fresh clean review of the new head (do **not** proceed straight to CI/merge on a post-review commit):
-   ```bash
-   rm -f "$STATE_FILE" "$STATE_FILE.tmp"   # before the first cleanup edit, if anything will be changed/pushed
-   ```
-   If the pass is a genuine no-op (nothing to apply, nothing pushed), retain the record and proceed. Then: **both modes** proceed to step 10 (CI watch, read-only) on the retained record, then **stop and report**. The record persists for the manual-merge recipe (step 11), which the user may run later — it is not part of the cycle.
+
+### 8. Commit and push
+- Commit fixes (and any deferred minor findings applied alongside them, per step 7) with a meaningful message (conventional commits style)
+- Push to remote
+- Return to step 4 ONLY if fewer than 3 cycles have run. This begins a **new review round**: **cloud** posts a fresh review request and runs the step-5 waiter again (it always waits a clean fixed window — nothing to reset); **local** re-runs `/review` (step 4) against the now-updated diff, plus Codex if configured. Keep a running count of completed cycles (one cycle = one steps 4–8 round **that triaged at least one `FIX`**). **Hard cap: 3 cycles.** If the round you just triaged was the 3rd and it still had `FIX` verdicts, do NOT loop again — stop and hand back to the user per the step-6 "3rd cycle" gate (summarize the open findings, propose moving some out of scope into a follow-up issue/PR, or rethinking the approach). The cap only bites when findings persist; a clean 1st or 2nd round finalizes normally.
+
+**Cycles vs. re-reviews — the cap counts only rounds with a `FIX`.** A return to step 4 triggered by step 9 (a cleanup commit that slipped past step 7) or step 10 (a CI fix) is a **re-review of the same cycle**, not a new cycle — it exists only to re-validate a head that moved after the reviewed snapshot, not to hunt for new findings. Do not increment the cycle counter for these; announce them to the user as "re-review of cycle N after `<cleanup|CI-fix>`", never as "cycle N+1" (this is what the user-visible bug looked like: three review rounds reported as three cycles, when only two were real `FIX`-bearing cycles). To keep a re-review loop from running forever, allow **at most 2 re-reviews per cycle**; if a 3rd is needed, stop and report to the user instead of looping again (mirrors the "same CI check fails >2 times" stop rule in step 10).
+
+### 9. Final gate (last cycle — normally a no-op, plus the roll-up summary)
+
+Reached only on the **final cycle** — when a round has no `FIX` verdicts (step 6) and a real review happened (silence gate passed — step 6 stops the cycle before here if any reviewer is still silent). By this point step 7 has already applied the deferred minor findings that existed when the fixing round ran, so this step is normally just a gate-check plus the summary post — **it should find nothing left to apply**. It exists to catch the one case step 7 can't cover: a round that was clean *from the start* (no `FIX`, so step 7 never ran) but still has un-applied `SKIP`/nice-to-have findings sitting from earlier rounds.
+
+**Ownership-aware.** Applying any edit here (and running the test suite/linter) is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), this step is a **no-op**: do not edit the PR or run its tests/linter locally — any remaining `SKIP`/nice-to-have findings are surfaced to the user and the bots, not applied on your machine.
+
+1. **Re-check for any still-unapplied minor finding**, using the exact same gather-and-dedup procedure as step 7's deferred-findings pass (same sources, same include/exclude list, same de-dup by `path`+`line`/gist) — but this time also excluding anything step 7 already applied earlier in this cycle. Two outcomes:
+   - **Nothing left (expected case)** — this step is a **no-op**: no commit, no push, the review-binding record stays intact. Tell the user plainly, e.g. "Deferred minor findings were already applied in step 7 of this cycle — nothing left to clean up." Skip straight to the summary post below, then step 10.
+   - **Something is still there (only possible when this round had zero `FIX`, so step 7 never ran)** — apply it now, following the same rules step 7 uses:
+     2. **Apply all of them.** Make the edits, keeping each change minimal and faithful to the reviewer's intent. If a suggested change would be risky, change behavior, or contradicts the repo's conventions, do NOT force it — leave a short reply explaining why it was left out (this is the only thing that may remain unfixed).
+     3. **Lint and test green**, same as step 7 (`ruff check src/ tests/`, `pytest tests/ -v` — or the repo's equivalents).
+     4. **Commit and push** (conventional-commits style, e.g. `chore: apply non-blocking review nitpicks before merge`). On the PR, briefly note that the deferred minor findings were applied in `<sha>`.
+     5. **A cleanup commit invalidates the review-binding record.** If this pass changes or pushes any file, the PR head has moved off the reviewed `ROUND_HEAD_SHA` — the binding no longer holds. Delete the record **before the first cleanup edit** (not after the push), then make the edits, commit, push, and **return to step 4 as a re-review of this same cycle** (per step 8's "cycles vs. re-reviews" rule — this does NOT consume one of the 3 cycles, and is capped at 2 re-reviews before stopping) for a fresh clean review of the new head (do **not** proceed straight to CI/merge on a post-review commit):
+        ```bash
+        rm -f "$STATE_FILE" "$STATE_FILE.tmp"   # before the first cleanup edit, if anything will be changed/pushed
+        ```
+        Then: **both modes** proceed to step 10 (CI watch, read-only) once that re-review comes back clean, then **stop and report**. The record persists for the manual-merge recipe (step 11), which the user may run later — it is not part of the cycle.
 
 **Post a final review-summary table on the PR** (both modes). Accumulate from **every** prior review round — include findings from **both** reviewers (claude `/review` AND Codex companion, plus any human comments). This is the roll-up of the entire review history: what was caught, what was fixed (and in which commit), what was deliberately skipped, and what was UNVERIFIED.
 
@@ -636,7 +646,7 @@ gh pr comment <PR> --body "$SUMMARY_BODY"   # Bash, dangerouslyDisableSandbox: t
 
 **Important:** `<agent-authored interpretation ...>` is a semantic placeholder, not a reviewer-title placeholder. The agent must formulate it from its verified understanding without reusing reviewer wording. Keep it to one neutral line of about 80 characters and avoid Markdown table delimiters. If the agent cannot describe the issue without copying the reviewer, stop and report that the public summary could not be produced; never fall back to the original text.
 
-This table is informational — it does not affect merge decisions. After posting it, proceed per the cloud/local branch above (step 9.5).
+This table is informational — it does not affect merge decisions. After posting it, proceed per the no-op/apply branch above (step 9, point 1).
 
 ### 10. Watch CI (both modes, read-only)
 
@@ -652,7 +662,7 @@ If any check has failed — read the logs of the failed run:
 gh run list --branch <HEAD_BRANCH> --limit 5 --json databaseId,name,status,conclusion --jq '.[] | select(.conclusion == "failure")'
 gh run view <RUN_ID> --log-failed
 ```
-Identify the root cause, apply fixes, commit and push (follow the commit style from step 8), then **return to step 4** for a fresh clean review of the new head — a post-review commit invalidates the review-binding record (as in step 9.5), so the cycle re-reviews and re-watches CI. Repeat until a clean review lands on a green-CI head; then **stop and report** (do not merge — that is the user's action).
+Identify the root cause, apply fixes, commit and push (follow the commit style from step 8), then **return to step 4 as a re-review of this same cycle** (per step 8's "cycles vs. re-reviews" rule — this does NOT consume one of the 3 cycles, and is capped at 2 re-reviews before stopping) for a fresh clean review of the new head — a post-review commit invalidates the review-binding record (as in step 9), so the cycle re-reviews and re-watches CI. Repeat until a clean review lands on a green-CI head; then **stop and report** (do not merge — that is the user's action).
 
 **Ownership-aware (do not edit a foreign PR's CI failures locally).** Applying CI fixes — editing code, running the repo's test suite/linter (the global pre-commit rule), committing, pushing — is **only for a PR you own** (`OWN_PR=true`). For a **foreign PR** (`OWN_PR=false`), do **not** edit/test/commit locally: surface the CI failure to the user (and re-run the bots), do not fix someone else's CI failure on your machine. If a foreign PR's CI can't go green, stop and hand back to the user.
 
