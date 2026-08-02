@@ -288,14 +288,16 @@ Any mismatch before an invoke → do **not** invoke that reviewer; discard the r
      Run both checks in one bash invocation (plain shell, no network — does not itself need `dangerouslyDisableSandbox`; only the companion invocation further below does):
      ```bash
      COMPANION=""
+     OVERRIDE_BROKEN=false
      if [ -n "${CYCLE_REVIEW_CODEX_COMPANION_PATH:-}" ]; then
        if [ -f "$CYCLE_REVIEW_CODEX_COMPANION_PATH" ]; then
          COMPANION="$CYCLE_REVIEW_CODEX_COMPANION_PATH"
        else
+         OVERRIDE_BROKEN=true
          echo "CYCLE_REVIEW_CODEX_COMPANION_PATH is set but does not point at an existing file: $CYCLE_REVIEW_CODEX_COMPANION_PATH" >&2
        fi
      fi
-     if [ -z "$COMPANION" ]; then
+     if [ -z "$COMPANION" ] && [ "$OVERRIDE_BROKEN" = false ]; then
        COMPANION=$(jq -r '
            .plugins | to_entries[]
            | select(.key | split("@")[0] | test("^codex(-fork)?$"))
@@ -311,7 +313,7 @@ Any mismatch before an invoke → do **not** invoke that reviewer; discard the r
            done)
      fi
      ```
-     If `$COMPANION` is still empty after both checks, the codex plugin is **not installed** at user scope via the marketplace, and no valid `CYCLE_REVIEW_CODEX_COMPANION_PATH` override was provided (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 6.
+     **`OVERRIDE_BROKEN` gates the manifest resolver, not just an empty `$COMPANION`** — a broken explicit override must fail closed, never silently fall through to a different executable the user didn't name. If `$COMPANION` is empty because `OVERRIDE_BROKEN=true`, stop with the broken-override message (step 6) — do NOT consult the manifest. If `$COMPANION` is empty and `OVERRIDE_BROKEN=false` (override unset), the codex plugin is **not installed** at user scope via the marketplace — treat as the plugin-not-found fail-closed case in step 6.
 
      > Why not `${CLAUDE_PLUGIN_ROOT}`? That env var is substituted by Claude Code only inside the *owning* plugin's commands/hooks — in a cycle-review session it points at cycle-review (or is unset), so it can't address a sibling plugin. `installed_plugins.json` is the only cross-plugin source of truth for install paths.
    - **Base for the review is the round's immutable base SHA** (`ROUND_BASE_SHA` from step 4) — pass that, **not** the mutable branch name. The companion resolves `--base` via local `git merge-base`/`git diff`, so a mutable name (e.g. `main`) would let a stale local ref review the wrong diff while the record stores the current remote base SHA.
@@ -359,7 +361,7 @@ Any mismatch before an invoke → do **not** invoke that reviewer; discard the r
    **(b) Collect the final output (after the Monitor ends / the shell exits).** Read the full `BashOutput` of `$CODEX_SHELL_ID`: the JSON is on **stdout**, the progress log on **stderr**, and the shell's **exit code** is reported in the background-task status. Capture the stdout JSON → step 4.5 maps it to findings. **Do not proceed until the background shell has exited** — a still-running Codex is not a result. (If the `Skill` `/review` call errored, see the fail-closed in step 6 regardless of Codex's result.)
 
 4. **Fail-closed check (Codex configured but did not return a verdict).** **Detection is one rule, cause-agnostic: if Codex returned no parseable `.result` this round — companion missing, non-zero exit, or exit-0 with empty/`.parseError`/absent `.result` — it is silent, and silence is not approval** (root invariant in `## Important`). Every silent shape stops the same way; do NOT continue on `/review` alone. The cause only shapes the *user-facing message*:
-   - **Companion not found** (`$COMPANION` empty): if the resolver above printed a `CYCLE_REVIEW_CODEX_COMPANION_PATH ... does not point at an existing file` line to stderr, surface that exact message — it's almost certainly a typo/stale path. Otherwise, the codex plugin is not installed at user scope and no override was set: tell the user both remediation paths in one message — "Codex plugin not found. If you installed it via `/plugin`, check it's user-scoped (not local/project). If you're running a manual/dev install not registered in `installed_plugins.json`, set `CYCLE_REVIEW_CODEX_COMPANION_PATH=/path/to/codex-companion.mjs` in your shell profile and re-run." Do **NOT** suggest `codex login` here — nothing to log in to yet.
+   - **Companion not found** (`$COMPANION` empty): if `OVERRIDE_BROKEN=true` (the resolver printed a `CYCLE_REVIEW_CODEX_COMPANION_PATH ... does not point at an existing file` line to stderr), surface that exact message and stop — the manifest resolver was deliberately **not** consulted (fail-closed on the override, not a fallback), so do not run a manifest-found companion instead. Otherwise (`OVERRIDE_BROKEN=false`, override unset): the codex plugin is not installed at user scope and no override was set: tell the user both remediation paths in one message — "Codex plugin not found. If you installed it via `/plugin`, check it's user-scoped (not local/project). If you're running a manual/dev install not registered in `installed_plugins.json`, set `CYCLE_REVIEW_CODEX_COMPANION_PATH=/path/to/codex-companion.mjs` in your shell profile and re-run." Do **NOT** suggest `codex login` here — nothing to log in to yet.
    - **Non-zero exit** — read stderr for the message (the stop decision does not depend on it): install/login text (e.g. `npm install -g @openai/codex`, `codex login`) → ask to install/log in; upstream/server text (5xx, `503`, `circuit_open`, throttling, timeout) → tell the user Codex's upstream is unavailable; anything else → report the exact stderr. (This list is a heuristic for the message, not a detection allow-list — `any other non-zero exit` is still silent.)
    - **Exit-0 but no parseable `.result`** (empty stdout, `.parseError`, or `.result` absent): Codex ran but returned nothing usable — silent, not clean. (Overlaps step 4.5's parse check; both must stop.)
 
