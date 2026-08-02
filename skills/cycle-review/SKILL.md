@@ -30,7 +30,7 @@ The skill has **two review modes**. Pick the active one in step 1 before anythin
 
 **Both modes are review-only on merge.** Each mode runs the full triage→reply→fix→commit→push loop, then watches CI (`gh pr checks --watch`, step 10 — read-only) and auto-fixes a red CI, then **stops and reports**. The skill **never merges on its own** — merge is a user action. A **Manual merge recipe** (step 11) is provided for when the user later asks to merge, but the cycle does not walk into it. (Previously cloud mode merged autonomously at step 11; removed in 0.5.2.)
 
-**Dev mode (codex-fork only):** when the installed codex plugin is the fork (the companion path contains a `-fork/` segment, e.g. `.../codex-fork/1.0.6-fork.3/...`), onboarding (step 0) additionally asks for a default **Codex model** and **effort**, stored in config and passed to the companion every round as `--model`/`--effort` (step 4) — so you stop setting them ad-hoc. Per-run override: `--model <v>` / `--effort <v>` in the arguments (step 1). Upstream `codex` (no `-fork/` in the path) ignores both; behavior is unchanged.
+**Dev mode (codex-fork only):** when the installed codex plugin is the fork (the resolved plugin's `version` in its `plugin.json` contains `-fork`, e.g. `1.0.6-fork.6` — detected from `plugin.json` next to the companion script, not from the companion's file path, since a manual dev symlink can put the fork at a path with no `-fork/` segment at all), onboarding (step 0) additionally asks for a default **Codex model** and **effort**, stored in config and passed to the companion every round as `--model`/`--effort` (step 4) — so you stop setting them ad-hoc. Per-run override: `--model <v>` / `--effort <v>` in the arguments (step 1). Upstream `codex` (version has no `-fork`) ignores both; behavior is unchanged.
 
 ## Cycle
 
@@ -40,7 +40,7 @@ Run step 0 (onboarding) and step 1 (resolve mode) once at the start of every inv
 
 The skill needs two things from the user, stored once: which review bots they have installed (`@claude`, `@codex`, or both — drives cloud mode), and the **default review mode** (`cloud` or `local`). The reviewers list drives who gets pinged in step 4 and whose comments we wait for in step 5 (cloud only). The mode is the default when no `local`/`cloud` flag is passed (step 1).
 
-If a **codex-fork** is the installed codex plugin (the companion path contains a `-fork/` segment, e.g. `.../codex-fork/1.0.6-fork.3/...` — see the detect in step 4), a **dev mode** unlocks two extra onboarding fields: a default **Codex model** and **effort** that are passed to the companion every round so you stop setting them ad-hoc in code. Upstream `codex` (no `-fork/` in the path) does not support these flags and the fields stay absent. **Dev-mode fields are written only during onboarding** — an existing v1/v2 config is not auto-upgraded; to enable dev mode on an existing install, re-run `/cycle-review onboard` (the step-0 detect will then offer the model/effort questions).
+If a **codex-fork** is the installed codex plugin (the resolved plugin's `version` in `plugin.json` contains `-fork`, e.g. `1.0.6-fork.6` — see the detect in step 4), a **dev mode** unlocks two extra onboarding fields: a default **Codex model** and **effort** that are passed to the companion every round so you stop setting them ad-hoc in code. Upstream `codex` (no `-fork/` in the path) does not support these flags and the fields stay absent. **Dev-mode fields are written only during onboarding** — an existing v1/v2 config is not auto-upgraded; to enable dev mode on an existing install, re-run `/cycle-review onboard` (the step-0 detect will then offer the model/effort questions).
 
 **Config location (global, per user):** `~/.claude/cycle-review/config.json`. It is intentionally global — not committed into the reviewed repo, set once, reused across all projects.
 
@@ -66,12 +66,20 @@ If a **codex-fork** is the installed codex plugin (the companion path contains a
    ```
    `CONFIGURED` → read the reviewers and mode (the read commands below) and skip to step 1. `NEEDS_ONBOARDING` (missing file, malformed JSON, or empty `reviewers`) → run onboarding.
 
-2. **Detect dev mode (codex-fork).** Run the companion resolver from step 4.1 and check the version segment of the resolved path:
+2. **Detect dev mode (codex-fork).** Run the companion resolver from step 4.1, then read the resolved plugin's **`version`** from its `plugin.json` — not the companion's file path. A path-based check (`*-fork/*`) only holds for the marketplace cache layout (`.../codex-fork/1.0.6-fork.6/...`); a manual dev symlink (e.g. `CYCLE_REVIEW_CODEX_COMPANION_PATH` pointing at `~/.claude/skills/codex/scripts/...`) can resolve to the same fork build at a path with no `-fork/` segment at all, so the path check silently misses it and dev mode never turns on. The plugin's own `version` field is authoritative regardless of where the checkout lives:
    ```bash
    CODEX_FORK=false
-   [ -n "$COMPANION" ] && case "$COMPANION" in *-fork/*) CODEX_FORK=true;; esac
+   if [ -n "$COMPANION" ]; then
+     CODEX_MANIFEST="$(dirname "$(dirname "$COMPANION")")/.claude-plugin/plugin.json"
+     CODEX_VERSION=$(jq -r '.version // empty' "$CODEX_MANIFEST" 2>/dev/null)
+     case "$CODEX_VERSION" in *-fork*) CODEX_FORK=true;; esac
+     # Fallback if plugin.json is unreadable: old path-based check (still correct for the cache layout).
+     if [ -z "$CODEX_VERSION" ]; then
+       case "$COMPANION" in *-fork/*) CODEX_FORK=true;; esac
+     fi
+   fi
    ```
-   (`codex-fork/1.0.6-fork.3/...` → matches `*-fork/*` → `CODEX_FORK=true`. Upstream `codex/1.0.6/...` → `false`. If no codex plugin is installed, `$COMPANION` is empty → `false`, and the dev-mode questions are skipped.)
+   (`version: "1.0.6-fork.6"` → matches `*-fork*` → `CODEX_FORK=true`, regardless of whether `$COMPANION` came from the cache or a dev symlink. Upstream `codex` (`version: "1.0.6"`, no `-fork`) → `false`. If no codex plugin is installed, `$COMPANION` is empty → `false`, and the dev-mode questions are skipped. `<companion>/../../.claude-plugin/plugin.json` resolves correctly for both the direct layout and the fork meta-plugin's nested `plugins/codex/scripts/` layout.)
 
 3. **Run onboarding — first `AskUserQuestion` (always):** reviewers + default mode (one tool call, two questions):
    - **Reviewers** (multi-select): `@claude`, `@codex` — which review bots they have (one or both). Used by cloud mode.
@@ -317,21 +325,30 @@ Any mismatch before an invoke → do **not** invoke that reviewer; discard the r
 
      > Why not `${CLAUDE_PLUGIN_ROOT}`? That env var is substituted by Claude Code only inside the *owning* plugin's commands/hooks — in a cycle-review session it points at cycle-review (or is unset), so it can't address a sibling plugin. `installed_plugins.json` is the only cross-plugin source of truth for install paths.
    - **Base for the review is the round's immutable base SHA** (`ROUND_BASE_SHA` from step 4) — pass that, **not** the mutable branch name. The companion resolves `--base` via local `git merge-base`/`git diff`, so a mutable name (e.g. `main`) would let a stale local ref review the wrong diff while the record stores the current remote base SHA.
-   - **Detect dev mode (codex-fork) from the resolved path**, then build the optional `--model`/`--effort` flags from config + per-run override. Dev mode is on when the companion path contains a `-fork/` segment:
+   - **Detect dev mode (codex-fork) from the resolved plugin's `version`**, then build the optional `--model`/`--effort` flags from config + per-run override. Dev mode is on when `version` (read from `plugin.json` next to the companion) contains `-fork` — same rule as step 0.2, checked again here since step 4 can run without having gone through onboarding this session:
      ```bash
      CODEX_FORK=false
-     case "$COMPANION" in *-fork/*) CODEX_FORK=true;; esac
+     if [ -n "$COMPANION" ]; then
+       CODEX_MANIFEST="$(dirname "$(dirname "$COMPANION")")/.claude-plugin/plugin.json"
+       CODEX_VERSION=$(jq -r '.version // empty' "$CODEX_MANIFEST" 2>/dev/null)
+       case "$CODEX_VERSION" in *-fork*) CODEX_FORK=true;; esac
+       if [ -z "$CODEX_VERSION" ]; then
+         case "$COMPANION" in *-fork/*) CODEX_FORK=true;; esac  # fallback: plugin.json unreadable
+       fi
+     fi
+     CODEX_MODEL=$(jq -r '.codex_model // empty' "$HOME/.claude/cycle-review/config.json" 2>/dev/null)
+     CODEX_EFFORT=$(jq -r '.codex_effort // empty' "$HOME/.claude/cycle-review/config.json" 2>/dev/null)
      CODEX_FLAGS=""
      if [ "$CODEX_FORK" = true ]; then
-       CODEX_MODEL=$(jq -r '.codex_model // empty' "$HOME/.claude/cycle-review/config.json" 2>/dev/null)
-       CODEX_EFFORT=$(jq -r '.codex_effort // empty' "$HOME/.claude/cycle-review/config.json" 2>/dev/null)
        [ -n "$RUN_MODEL" ]  && CODEX_MODEL="$RUN_MODEL"     # per-run override from step 1
        [ -n "$RUN_EFFORT" ] && CODEX_EFFORT="$RUN_EFFORT"
        [ -n "$CODEX_MODEL" ]  && CODEX_FLAGS="$CODEX_FLAGS --model $CODEX_MODEL"
        [ -n "$CODEX_EFFORT" ] && CODEX_FLAGS="$CODEX_FLAGS --effort $CODEX_EFFORT"
+     elif [ -n "$CODEX_MODEL" ] || [ -n "$CODEX_EFFORT" ]; then
+       echo "Note: config has codex_model/codex_effort set, but the resolved codex plugin (version $CODEX_VERSION) is not a -fork build — these settings are ignored this round. Re-run '/cycle-review onboard' against a fork install to use them, or ignore if this is expected." >&2
      fi
      ```
-     `CODEX_FLAGS` is left empty on upstream codex (`CODEX_FORK=false`) and when no model/effort is configured — the companion then uses its own defaults (the pre-dev-mode behavior). Values are not re-validated here; the companion validates `--model`/`--effort` itself and a bad value surfaces as stderr → step 6 fail-closed.
+     `CODEX_FLAGS` is left empty on upstream codex (`CODEX_FORK=false`) and when no model/effort is configured — the companion then uses its own defaults (the pre-dev-mode behavior). This is a one-line heads-up for a config/plugin mismatch, not a fail-closed condition — the round proceeds normally with default model/effort; fail-closed stays reserved for reviewer silence (step 6). Values are not re-validated here; the companion validates `--model`/`--effort` itself and a bad value surfaces as stderr → step 6 fail-closed.
    - **Invoke the companion in the background, JSON output, against the PR base:**
      ```bash
      node "$COMPANION" adversarial-review --wait --json --base "$ROUND_BASE_SHA" $CODEX_FLAGS \
