@@ -277,27 +277,41 @@ test -z "$(git status --porcelain --untracked-files=all)" || { echo "Working tre
 Any mismatch before an invoke → do **not** invoke that reviewer; discard the round and stop or restart step 4. Any mismatch after the reviewers finish → ignore all local results from this round and stop or restart step 4. Tag each accepted local reviewer result `reviewed_sha: ROUND_HEAD_SHA`. (These checks attest the launch decision; they do not sandbox or redesign the vendor reviewer. Base-binding is re-verified from the GitHub PR object in step 6 before persisting — local refs can drift, so the authoritative base is `gh pr view`, not the local checkout.)
 
 1. **Start Codex first (background) when `@codex` is configured**, so it runs while `/review` works:
-   - **Resolve the companion path from the installed-plugins manifest — never hardcode the source namespace or path layout.** `~/.claude/plugins/installed_plugins.json` is the canonical plugin→installPath index (`{ "version": 2, "plugins": { "<name>@<marketplace>": [{ installPath, version, scope, projectPath, lastUpdated, ... }] } }`). Filter carefully, because the chosen script runs with `dangerouslyDisableSandbox: true` (network) — a wrong pick can execute an unrelated plugin impersonating the reviewer:
+   - **Resolve the companion path — manual override first, then the installed-plugins manifest; never hardcode the source namespace or path layout.** If `CYCLE_REVIEW_CODEX_COMPANION_PATH` is set and points at an existing file, use it directly as `$COMPANION` and skip the manifest resolver. This is the escape hatch for installs the manifest structurally cannot see — most commonly a manual dev symlink (e.g. `~/.claude/skills/codex` → a local git clone) that never went through `/plugin install`. Setting this var is an explicit, deliberate act by the user in their own shell profile — that intent is what authorizes running the resolved script with `dangerouslyDisableSandbox: true`, same basis as an `installed_plugins.json` hit. A set-but-broken override (non-empty but the file doesn't exist) fails closed — it does not silently fall back to the manifest resolver, since that would mask the user's typo.
+
+     Otherwise, resolve from `~/.claude/plugins/installed_plugins.json`, the canonical plugin→installPath index (`{ "version": 2, "plugins": { "<name>@<marketplace>": [{ installPath, version, scope, projectPath, lastUpdated, ... }] } }`). Filter carefully, because the chosen script runs with `dangerouslyDisableSandbox: true` (network) — a wrong pick can execute an unrelated plugin impersonating the reviewer:
      1. **Only `scope: "user"` entries.** A `user`-scoped install is globally enabled and valid in any repo. `local`/`project` entries are tied to another repo's `projectPath` and must NOT be eligible outside it — never run a plugin the user only enabled for a different project.
      2. **Explicit codex names only.** Match the plugin name (the part before `@`) against an allowlist of known codex plugins — `codex` (upstream `codex@openai-codex`) and `codex-fork` (`codex-fork@etopro-plugins`). A loose substring match (`codex`) risks catching an unrelated plugin whose name merely contains it.
      3. **Newest `lastUpdated` first.** Among the surviving entries, order by `lastUpdated` descending — that is the actively installed version, NOT the newest version sitting in the file cache (the cache holds leftovers the GC sweeps away; `.in_use/` PID-markers only protect from sweep, they don't pick the version).
      4. **Probe both path layouts, first existing wins** (preserving the timestamp order above — do NOT re-sort by path): the fork is a meta-plugin wrapping a `codex` sub-plugin (`<installPath>/plugins/codex/scripts/codex-companion.mjs`); the upstream direct plugin is `<installPath>/scripts/codex-companion.mjs`.
+
+     Run both checks in one bash invocation (plain shell, no network — does not itself need `dangerouslyDisableSandbox`; only the companion invocation further below does):
      ```bash
-     COMPANION=$(jq -r '
-         .plugins | to_entries[]
-         | select(.key | split("@")[0] | test("^codex(-fork)?$"))
-         | .value[]
-         | select(.scope == "user")
-         | select(.installPath and (.installPath | length > 0))
-         | "\(.lastUpdated // "")\t\(.installPath)"
-       ' "$HOME"/.claude/plugins/installed_plugins.json 2>/dev/null \
-       | sort -r | while IFS=$'\t' read -r _ ip; do
-           for cand in "$ip/plugins/codex/scripts/codex-companion.mjs" "$ip/scripts/codex-companion.mjs"; do
-             [ -f "$cand" ] && { echo "$cand"; break 2; }
-           done
-         done)
+     COMPANION=""
+     if [ -n "${CYCLE_REVIEW_CODEX_COMPANION_PATH:-}" ]; then
+       if [ -f "$CYCLE_REVIEW_CODEX_COMPANION_PATH" ]; then
+         COMPANION="$CYCLE_REVIEW_CODEX_COMPANION_PATH"
+       else
+         echo "CYCLE_REVIEW_CODEX_COMPANION_PATH is set but does not point at an existing file: $CYCLE_REVIEW_CODEX_COMPANION_PATH" >&2
+       fi
+     fi
+     if [ -z "$COMPANION" ]; then
+       COMPANION=$(jq -r '
+           .plugins | to_entries[]
+           | select(.key | split("@")[0] | test("^codex(-fork)?$"))
+           | .value[]
+           | select(.scope == "user")
+           | select(.installPath and (.installPath | length > 0))
+           | "\(.lastUpdated // "")\t\(.installPath)"
+         ' "$HOME"/.claude/plugins/installed_plugins.json 2>/dev/null \
+         | sort -r | while IFS=$'\t' read -r _ ip; do
+             for cand in "$ip/plugins/codex/scripts/codex-companion.mjs" "$ip/scripts/codex-companion.mjs"; do
+               [ -f "$cand" ] && { echo "$cand"; break 2; }
+             done
+           done)
+     fi
      ```
-     If `$COMPANION` is empty, the codex plugin is **not installed** at user scope (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 6.
+     If `$COMPANION` is still empty after both checks, the codex plugin is **not installed** at user scope via the marketplace, and no valid `CYCLE_REVIEW_CODEX_COMPANION_PATH` override was provided (distinct from "installed but not logged in" below) — treat as the fail-closed case in step 6.
 
      > Why not `${CLAUDE_PLUGIN_ROOT}`? That env var is substituted by Claude Code only inside the *owning* plugin's commands/hooks — in a cycle-review session it points at cycle-review (or is unset), so it can't address a sibling plugin. `installed_plugins.json` is the only cross-plugin source of truth for install paths.
    - **Base for the review is the round's immutable base SHA** (`ROUND_BASE_SHA` from step 4) — pass that, **not** the mutable branch name. The companion resolves `--base` via local `git merge-base`/`git diff`, so a mutable name (e.g. `main`) would let a stale local ref review the wrong diff while the record stores the current remote base SHA.
@@ -345,7 +359,7 @@ Any mismatch before an invoke → do **not** invoke that reviewer; discard the r
    **(b) Collect the final output (after the Monitor ends / the shell exits).** Read the full `BashOutput` of `$CODEX_SHELL_ID`: the JSON is on **stdout**, the progress log on **stderr**, and the shell's **exit code** is reported in the background-task status. Capture the stdout JSON → step 4.5 maps it to findings. **Do not proceed until the background shell has exited** — a still-running Codex is not a result. (If the `Skill` `/review` call errored, see the fail-closed in step 6 regardless of Codex's result.)
 
 4. **Fail-closed check (Codex configured but did not return a verdict).** **Detection is one rule, cause-agnostic: if Codex returned no parseable `.result` this round — companion missing, non-zero exit, or exit-0 with empty/`.parseError`/absent `.result` — it is silent, and silence is not approval** (root invariant in `## Important`). Every silent shape stops the same way; do NOT continue on `/review` alone. The cause only shapes the *user-facing message*:
-   - **Companion not found** (`$COMPANION` empty): the codex plugin is not installed at user scope. Tell the user to install it via `/plugin` (do **NOT** suggest `codex login` — nothing to log in to yet).
+   - **Companion not found** (`$COMPANION` empty): if the resolver above printed a `CYCLE_REVIEW_CODEX_COMPANION_PATH ... does not point at an existing file` line to stderr, surface that exact message — it's almost certainly a typo/stale path. Otherwise, the codex plugin is not installed at user scope and no override was set: tell the user both remediation paths in one message — "Codex plugin not found. If you installed it via `/plugin`, check it's user-scoped (not local/project). If you're running a manual/dev install not registered in `installed_plugins.json`, set `CYCLE_REVIEW_CODEX_COMPANION_PATH=/path/to/codex-companion.mjs` in your shell profile and re-run." Do **NOT** suggest `codex login` here — nothing to log in to yet.
    - **Non-zero exit** — read stderr for the message (the stop decision does not depend on it): install/login text (e.g. `npm install -g @openai/codex`, `codex login`) → ask to install/log in; upstream/server text (5xx, `503`, `circuit_open`, throttling, timeout) → tell the user Codex's upstream is unavailable; anything else → report the exact stderr. (This list is a heuristic for the message, not a detection allow-list — `any other non-zero exit` is still silent.)
    - **Exit-0 but no parseable `.result`** (empty stdout, `.parseError`, or `.result` absent): Codex ran but returned nothing usable — silent, not clean. (Overlaps step 4.5's parse check; both must stop.)
 
